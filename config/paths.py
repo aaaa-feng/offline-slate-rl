@@ -45,8 +45,8 @@ OFFLINE_RL_RESULTS_DIR = RESULTS_ROOT / "offline_rl"
 # Embeddings目录
 EMBEDDINGS_DIR = DATA_ROOT / "embeddings"
 
-# MF Embeddings目录
-MF_EMBEDDINGS_DIR = DATA_ROOT / "mf_embeddings"
+# MF Embeddings目录（移动到embeddings子目录下）
+MF_EMBEDDINGS_DIR = EMBEDDINGS_DIR / "mf"
 
 # Checkpoints根目录
 CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
@@ -59,6 +59,17 @@ OFFLINE_RL_CKPT_DIR = CHECKPOINTS_DIR / "offline_rl"
 
 # GeMS checkpoints
 GEMS_CKPT_DIR = CHECKPOINTS_DIR / "gems"
+
+# ============================================================================
+# 原始数据和备份目录
+# ============================================================================
+
+# 原始数据目录（可选，用于存储.pkl等原始格式）
+RAW_DATA_DIR = DATA_ROOT / "raw"
+RAW_OFFLINE_DATA_DIR = RAW_DATA_DIR / "offline"
+
+# 备份目录
+BACKUPS_DIR = PROJECT_ROOT / "backups"
 
 # ============================================================================
 # 数据集子目录
@@ -168,7 +179,53 @@ def get_mf_embeddings_path(mf_checkpoint: str) -> Path:
     Returns:
         MF embeddings文件路径
     """
-    return MF_EMBEDDINGS_DIR / f"{mf_checkpoint}.pt"
+    if not mf_checkpoint.endswith('.pt'):
+        mf_checkpoint += '.pt'
+    return MF_EMBEDDINGS_DIR / mf_checkpoint
+
+
+def get_offline_dataset_path(env_name: str, filename: str = "expert_data_d4rl.npz") -> Path:
+    """
+    获取离线RL数据集路径
+
+    Args:
+        env_name: 环境名称（如 diffuse_topdown）
+        filename: 数据文件名（默认为 expert_data_d4rl.npz）
+
+    Returns:
+        数据集文件路径
+    """
+    return OFFLINE_DATASETS_DIR / env_name / filename
+
+
+def get_online_rl_checkpoint_path(checkpoint_name: str) -> Path:
+    """
+    获取在线RL checkpoint路径
+
+    Args:
+        checkpoint_name: checkpoint名称
+
+    Returns:
+        checkpoint文件路径
+    """
+    if not checkpoint_name.endswith('.ckpt'):
+        checkpoint_name += '.ckpt'
+    return ONLINE_RL_CKPT_DIR / checkpoint_name
+
+
+def get_offline_rl_checkpoint_path(checkpoint_name: str) -> Path:
+    """
+    获取离线RL checkpoint路径
+
+    Args:
+        checkpoint_name: checkpoint名称
+
+    Returns:
+        checkpoint文件路径
+    """
+    if not checkpoint_name.endswith('.ckpt'):
+        checkpoint_name += '.ckpt'
+    return OFFLINE_RL_CKPT_DIR / checkpoint_name
 
 
 def get_online_dataset_path(dataset_name: str) -> Path:
@@ -231,6 +288,7 @@ def ensure_all_dirs():
         OFFLINE_RL_RESULTS_DIR,
         LOGS_DIR,
         SWANLOG_DIR,
+        BACKUPS_DIR,
     ]
 
     for dir_path in dirs_to_create:

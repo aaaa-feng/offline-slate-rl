@@ -23,9 +23,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT.parent.parent))
 from config import paths
 
-from offline_rl_baselines.common.buffer import ReplayBuffer
-from offline_rl_baselines.common.utils import set_seed, compute_mean_std, soft_update
-from offline_rl_baselines.common.networks import Actor, Critic
+from common.offline.buffer import ReplayBuffer
+from common.offline.utils import set_seed, compute_mean_std, soft_update
+from common.offline.networks import Actor, Critic
 
 TensorBatch = List[torch.Tensor]
 

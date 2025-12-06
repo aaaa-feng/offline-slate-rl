@@ -10,7 +10,7 @@ from tqdm import tqdm
 from pathlib import Path
 from collections import deque
 
-from common.argument_parser import MyParser
+from common.online.argument_parser import MyParser
 
 
 class RecSim():

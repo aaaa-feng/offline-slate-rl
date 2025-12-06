@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,8 +22,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import GeMS-adapted components
-from offline_rl_baselines.common.buffer import ReplayBuffer as GemsReplayBuffer
-from offline_rl_baselines.common.utils import set_seed as gems_set_seed, compute_mean_std
+from common.offline.buffer import ReplayBuffer as GemsReplayBuffer
+from common.offline.utils import set_seed as gems_set_seed, compute_mean_std
 
 TensorBatch = List[torch.Tensor]
 

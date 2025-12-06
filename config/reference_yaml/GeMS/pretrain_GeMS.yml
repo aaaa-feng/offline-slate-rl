@@ -1,0 +1,15 @@
+ranker : "GeMS"
+max_epochs : 15
+dataset : [
+"data/RecSim/datasets/focused_topdown.pt",
+"data/RecSim/datasets/diffuse_topdown.pt"
+]
+seed : [58407201]
+item_embedds : ["scratch"]
+lambda_click : 0.5
+lambda_KL : 1.0
+lambda_prior : 0.0
+latent_dim : 32
+device : "cuda"
+batch_size : 256
+ranker_lr : 0.001

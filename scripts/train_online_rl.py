@@ -6,6 +6,7 @@ CC BY-NC-SA 4.0
 import torch
 import random
 import pytorch_lightning as pl
+from datetime import datetime
 
 import sys
 import os
@@ -25,10 +26,11 @@ from paths import (
     get_gems_checkpoint_path, get_online_ckpt_dir, get_online_rl_results_dir
 )
 
-from common.data_utils import BufferDataModule, EnvWrapper, get_file_name
+from common.online.data_module import BufferDataModule
+from common.online.env_wrapper import EnvWrapper, get_file_name
 from envs.RecSim.simulators import TopicRec
 from agents.online import DQN, SAC, SlateQ, REINFORCE, REINFORCESlate, EpsGreedyOracle, RandomSlate, STOracleSlate, WolpertingerSAC
-from common.argument_parser import MainParser
+from common.online.argument_parser import MainParser
 from belief_encoders.gru_belief import BeliefEncoder, GRUBelief
 from rankers.gems.rankers import Ranker, TopKRanker, kHeadArgmaxRanker, GeMS
 from rankers.gems.item_embeddings import ItemEmbeddings, MFEmbeddings
@@ -262,6 +264,14 @@ if main_args.agent == "SAC" and ranker_class == GeMS:
 ## Training procedure ##
 ########################
 
+### Set SwanLab log directory
+# SwanLab data will be saved to: experiments/swanlog/
+if args.swan_logdir is None:
+    swan_log_dir = PROJECT_ROOT / "experiments" / "swanlog"
+    swan_log_dir.mkdir(parents=True, exist_ok=True)
+    args.swan_logdir = str(swan_log_dir)
+    print(f"📁 SwanLab directory: {args.swan_logdir}")
+
 ### Logger
 logger_kwargs = {
     "project": args.swan_project or args.exp_name,
@@ -278,36 +288,113 @@ logger_kwargs = {
 exp_logger = SwanlabLogger(**logger_kwargs)
 exp_logger.log_hyperparams(logger_arg_dict)
 
-### Checkpoint
+
+
+
+
+
+
+
+# ### Checkpoint
+# # Use ranker_dataset for GeMS, MF_checkpoint for baselines
+# checkpoint_dir_name = getattr(args, 'ranker_dataset', None) or getattr(args, 'MF_checkpoint', None) or "default"
+# ckpt_dir = str(get_online_ckpt_dir(checkpoint_dir_name))
+# if ranker is not None:
+#     ckpt_name = args.name + "_" + ranker_checkpoint + "_agentseed" + str(seed) + "_gamma" + str(args.gamma)
+#     if ranker.__class__ not in [GeMS]:
+#         ckpt_name += "_rankerembedds-" + arg_dict["item_embedds"]
+# else:
+#     ckpt_name = args.name + "_seed" + str(seed)
+#     # 只有RL算法才有gamma参数（排除Random, STOracle等简单agent）
+#     if agent.__class__ not in [RandomSlate, EpsGreedyOracle, STOracleSlate] and hasattr(args, 'gamma'):
+#         ckpt_name += "_gamma" + str(args.gamma)
+# ckpt = ModelCheckpoint(monitor = 'val_reward', dirpath = ckpt_dir, filename = ckpt_name, mode = 'max')
+
+# ### Agent
+# trainer_agent = pl.Trainer(logger=exp_logger, enable_progress_bar = args.progress_bar, callbacks = [RichProgressBar(), ckpt],
+#                             log_every_n_steps = args.log_every_n_steps, max_steps = args.max_steps + 1,
+#                             check_val_every_n_epoch = args.check_val_every_n_epoch,
+#                             gpus = 1 if args.device == "cuda" else None, enable_model_summary = False)
+
+
+### Checkpoint Logic
 # Use ranker_dataset for GeMS, MF_checkpoint for baselines
 checkpoint_dir_name = getattr(args, 'ranker_dataset', None) or getattr(args, 'MF_checkpoint', None) or "default"
-ckpt_dir = str(get_online_ckpt_dir(checkpoint_dir_name))
-if ranker is not None:
-    ckpt_name = args.name + "_" + ranker_checkpoint + "_agentseed" + str(seed) + "_gamma" + str(args.gamma)
-    if ranker.__class__ not in [GeMS]:
-        ckpt_name += "_rankerembedds-" + arg_dict["item_embedds"]
+
+# 1. Determine save path
+if args.save_path:
+    ckpt_dir = args.save_path
+    if not ckpt_dir.endswith("/"): ckpt_dir += "/"
 else:
-    ckpt_name = args.name + "_seed" + str(seed)
-    # 只有RL算法才有gamma参数（排除Random, STOracle等简单agent）
+    ckpt_dir = str(get_online_ckpt_dir(checkpoint_dir_name)) + "/"
+Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+
+# 2. Determine base filename
+if ranker is not None:
+    base_ckpt_name = args.name + "_" + ranker_checkpoint + "_agentseed" + str(seed) + "_gamma" + str(args.gamma)
+    if ranker.__class__ not in [GeMS]:
+        base_ckpt_name += "_rankerembedds-" + arg_dict["item_embedds"]
+else:
+    base_ckpt_name = args.name + "_seed" + str(seed)
     if agent.__class__ not in [RandomSlate, EpsGreedyOracle, STOracleSlate] and hasattr(args, 'gamma'):
-        ckpt_name += "_gamma" + str(args.gamma)
-ckpt = ModelCheckpoint(monitor = 'val_reward', dirpath = ckpt_dir, filename = ckpt_name, mode = 'max')
+        base_ckpt_name += "_gamma" + str(args.gamma)
+
+callbacks_list = [RichProgressBar()]
+
+# 3. Callback A: Best Model (Always active)
+# Suffix: _best.ckpt
+ckpt_best = ModelCheckpoint(
+    monitor='val_reward', 
+    dirpath=ckpt_dir, 
+    filename=base_ckpt_name + "_best", 
+    mode='max',
+    save_last=True
+)
+callbacks_list.append(ckpt_best)
+
+# 4. Callback B: Step Interval (Optional)
+# Suffix: _step{step}.ckpt
+if args.save_every_n_steps > 0:
+    ckpt_interval = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename=base_ckpt_name + "_step{step}", 
+        every_n_train_steps=args.save_every_n_steps,
+        save_top_k=-1, # Keep ALL
+        save_weights_only=False,
+        save_on_train_epoch_end=False
+    )
+    callbacks_list.append(ckpt_interval)
+    print(f"✅ Enabled interval checkpointing every {args.save_every_n_steps} steps.")
+
+    # Keep validation frequency separate from checkpoint frequency
+    # Validation will run every val_check_interval steps (default or user-specified)
+    # Checkpoint will only be saved at save_every_n_steps 
 
 ### Agent
-trainer_agent = pl.Trainer(logger=exp_logger, enable_progress_bar = args.progress_bar, callbacks = [RichProgressBar(), ckpt],
-                            log_every_n_steps = args.log_every_n_steps, max_steps = args.max_steps + 1,
-                            check_val_every_n_epoch = args.check_val_every_n_epoch,
-                            gpus = 1 if args.device == "cuda" else None, enable_model_summary = False)
+trainer_agent = pl.Trainer(
+    logger=exp_logger,
+    enable_progress_bar=args.progress_bar,
+    callbacks=callbacks_list,
+    log_every_n_steps=args.log_every_n_steps,
+    max_steps=args.max_steps + 1,
+    check_val_every_n_epoch=args.check_val_every_n_epoch,
+    gpus=1 if args.device == "cuda" else None,
+    enable_model_summary=False
+)
+
+if args.save_every_n_steps > 0:
+    trainer_agent.save_step_target = args.save_every_n_steps
 
 fit_loop = ResettableFitLoop(max_epochs_per_iter = args.iter_length_agent)
 episode_loop = TrainingEpisodeLoop(env, buffer.buffer, belief, agent, ranker, random_steps = args.random_steps,
                                             max_steps = args.max_steps + 1, device = args.device)
 
 res_dir = str(get_online_rl_results_dir(checkpoint_dir_name))
+# [Fixed] Use base_ckpt_name instead of ckpt_name
 val_loop = ValEpisodeLoop(belief = belief, agent = agent, ranker = ranker, trainer = trainer_agent,
-                            filename_results = res_dir + "/" + ckpt_name + ".pt", **arg_dict)
+                            filename_results = res_dir + "/" + base_ckpt_name + ".pt", **arg_dict)
 test_loop = TestEpisodeLoop(belief = belief, agent = agent, ranker = ranker, trainer = trainer_agent,
-                            filename_results = res_dir + ckpt_name + ".pt", **arg_dict)
+                            filename_results = res_dir + "/" + base_ckpt_name + ".pt", **arg_dict)
 trainer_agent.fit_loop.epoch_loop.val_loop.connect(val_loop)
 trainer_agent.test_loop.connect(test_loop)
 episode_loop.connect(batch_loop = trainer_agent.fit_loop.epoch_loop.batch_loop, val_loop = trainer_agent.fit_loop.epoch_loop.val_loop)
@@ -318,12 +405,28 @@ if agent.__class__ not in [EpsGreedyOracle, RandomSlate, STOracleSlate]:
     trainer_agent.fit(agent, buffer)
 
     env.env.reset_random_state()
-    res = trainer_agent.test(model=agent, ckpt_path=ckpt_dir + "/" + ckpt_name + ".ckpt", verbose=True, datamodule=buffer)
+    
+    # [Fixed] Load logic for final testing
+    # Prioritize step model if strategy is step, otherwise best model
+    if args.save_every_n_steps > 0:
+        step_ckpt = ckpt_dir + base_ckpt_name + f"_step{args.save_every_n_steps}.ckpt"
+        if os.path.exists(step_ckpt):
+            print(f"\n### Loading specific step model for testing: {step_ckpt}")
+            test_ckpt_path = step_ckpt
+        else:
+            print(f"⚠️ Warning: Step {args.save_every_n_steps} model not found. Falling back to best model.")
+            test_ckpt_path = ckpt_dir + base_ckpt_name + "_best.ckpt"
+    else:
+        test_ckpt_path = ckpt_dir + base_ckpt_name + "_best.ckpt"
 
-    ### Test reward in checkpoint
-    ckpt = torch.load(ckpt_dir + "/" + ckpt_name + ".ckpt")
-    list(ckpt["callbacks"].values())[0]["test_reward"] = res[0]["test_reward"]
-    torch.save(ckpt, ckpt_dir + "/" + ckpt_name + ".ckpt")
+    print(f"### Loading model from: {test_ckpt_path}")
+    
+    if os.path.exists(test_ckpt_path):
+        res = trainer_agent.test(model=agent, ckpt_path=test_ckpt_path, verbose=True, datamodule=buffer)
+        print(f"### Test finished. Reward: {res[0]['test_reward']}")
+    else:
+        print(f"❌ Error: No checkpoint found to test at {test_ckpt_path}")
+
 else:
     env.env.reset_random_state()
     res = trainer_agent.test(model=agent, verbose=True, datamodule=buffer)

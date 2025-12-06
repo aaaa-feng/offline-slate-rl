@@ -11,9 +11,9 @@ from collections import OrderedDict
 from typing import List, Any
 import copy
 
-from common.argument_parser import MyParser
+from common.online.argument_parser import MyParser
 from belief_encoders.gru_belief import BeliefEncoder
-from common.data_utils import EnvWrapper
+from common.online.env_wrapper import EnvWrapper
 from rankers.gems.rankers import Ranker
 
 ####

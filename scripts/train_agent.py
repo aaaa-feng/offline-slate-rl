@@ -182,14 +182,20 @@ elif main_args.item_embedds in ["ideal"]:
     item_embeddings = ItemEmbeddings.get_from_env(env, device = args.device)
     item_embeddings.freeze()    # No fine-tuning when we already have the ideal embeddings
 elif main_args.item_embedds in ["mf", "mf_fixed", "mf_init"]:
+    # 使用统一路径配置
+    from pathlib import Path
+    project_root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(project_root / "config"))
+    from paths import get_online_dataset_path, get_mf_embeddings_path
+
     if args.MF_checkpoint is None:
         item_embeddings = MFEmbeddings(**arg_dict)
         print("Pre-training MF embeddings ...")
-        dataset_path = args.data_dir + "datasets/" + args.MF_dataset
+        dataset_path = str(get_online_dataset_path(args.MF_dataset))
         item_embeddings.train(dataset_path)
         arg_dict["MF_checkpoint"] = args.MF_dataset
         print("Pre-training done.")
-    item_embeddings = ItemEmbeddings.from_pretrained(args.data_dir + "MF_embeddings/" + arg_dict["MF_checkpoint"] + ".pt", args.device)
+    item_embeddings = ItemEmbeddings.from_pretrained(str(get_mf_embeddings_path(arg_dict["MF_checkpoint"])), args.device)
     if main_args.item_embedds == "mf_fixed":
         item_embeddings.freeze()
 else:
@@ -209,14 +215,21 @@ if is_pomdp:
                 ranker_checkpoint = main_args.ranker + "_" + args.ranker_dataset
             ranker_checkpoint += "_latentdim" + str(arg_dict["latent_dim"]) + "_beta" + str(arg_dict["lambda_KL"]) + "_lambdaclick" + str(arg_dict["lambda_click"]) + \
                                     "_lambdaprior" + str(arg_dict["lambda_prior"]) + "_" + args.ranker_embedds + "_seed" + str(args.ranker_seed)
-            ranker = ranker_class.load_from_checkpoint(args.data_dir + "GeMS/checkpoints/" + ranker_checkpoint + ".ckpt",
+            # 使用统一路径配置
+            from pathlib import Path
+            project_root = Path(__file__).resolve().parent.parent
+            sys.path.insert(0, str(project_root / "config"))
+            from paths import get_gems_checkpoint_path, get_online_dataset_path
+
+            ranker = ranker_class.load_from_checkpoint(str(get_gems_checkpoint_path(ranker_checkpoint)),
                                                     map_location = args.device, item_embeddings = item_embeddings, **arg_dict)
             ranker.freeze()
             print("Getting action bounds ...")
             if args.ranker_dataset is None :
-                ranker.get_action_bounds(args.data_dir + "RecSim/datasets/" + args.click_model + "_" + args.logging_policy + "_10K.pt")
+                dataset_name = args.click_model + "_" + args.logging_policy + "_10K"
+                ranker.get_action_bounds(str(get_online_dataset_path(dataset_name)))
             else:
-                ranker.get_action_bounds(args.data_dir + "RecSim/datasets/" + args.ranker_dataset + ".pt")
+                ranker.get_action_bounds(str(get_online_dataset_path(args.ranker_dataset)))
                             ### We find the appropriate action bounds from the aggregated posterior.
         else:
             ranker = ranker_class(item_embeddings = item_embeddings, **arg_dict)

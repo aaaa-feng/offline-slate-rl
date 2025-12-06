@@ -44,6 +44,7 @@ data/datasets/
 checkpoints/
 results/
 swanlog/
+backups/
 
 # Logs
 *.log

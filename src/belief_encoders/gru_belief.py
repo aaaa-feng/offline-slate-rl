@@ -10,7 +10,7 @@ from typing import List, Dict
 import copy
 from torch.nn import Embedding, Sequential, Linear, ReLU, Tanh, GRU, ModuleDict
 
-from common.argument_parser import MyParser
+from common.online.argument_parser import MyParser
 from rankers.gems.item_embeddings import ItemEmbeddings
 from rankers.gems.rankers import Ranker
 

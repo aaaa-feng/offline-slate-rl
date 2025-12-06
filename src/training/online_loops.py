@@ -15,11 +15,12 @@ import os
 from collections import namedtuple
 from pathlib import Path
 
-from common.data_utils import EnvWrapper, ReplayBuffer
+from common.online.env_wrapper import EnvWrapper
+from common.online.buffer import ReplayBuffer
 from belief_encoders.gru_belief import BeliefEncoder
 from agents.online import Agent, EpsGreedyOracle, SlateQ
 from rankers.gems.rankers import Ranker
-from common.argument_parser import MyParser
+from common.online.argument_parser import MyParser
 
 
 Trajectory = namedtuple("Trajectory", ("obs", "action", "reward", "next_obs", "done"))
@@ -187,6 +188,13 @@ class TrainingEpisodeLoop(TrainingEpochLoop):
         if self.trainer.global_step % 100 == 0:
             progress = (self.trainer.global_step / self.max_steps_per_iter) * 100
             print(f"[Training Step {self.trainer.global_step}/{self.max_steps_per_iter}] ({progress:.1f}%) - Episode Reward: {self.cum_reward:.4f}, Length: {self.ep_length}", flush=True)
+
+        # [New] Print specific message for fixed-step saving
+        if hasattr(self.trainer, "save_step_target") and self.trainer.global_step == self.trainer.save_step_target:
+            print("\n" + "#" * 80)
+            print(f"### TARGET STEP REACHED: {self.trainer.global_step} ###")
+            print("### Triggering Validation and Checkpoint Saving... ###")
+            print("#" * 80 + "\n", flush=True)
 
         return output
 
