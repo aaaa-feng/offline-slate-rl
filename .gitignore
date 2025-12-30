@@ -38,9 +38,11 @@ env/
 # PyTorch
 *.pth
 *.ckpt
+*.pt
 
 # Data and results (large files)
 data/datasets/
+data/data_analysis/visualizations/
 checkpoints/
 results/
 swanlog/
@@ -48,8 +50,11 @@ backups/
 
 # Logs
 *.log
+*.out
+nohup*.out
 experiments/logs/
 experiments/swanlog/
+experiments/logs_verification/visualizations/
 
 # OS
 .DS_Store
@@ -60,3 +65,14 @@ Thumbs.db
 *.bak
 *.backup
 code_backup_*.tar.gz
+
+# PDF documents (papers and reports)
+*.pdf
+08_李岳峰_基于离线强化学习的组合推荐算法研究.pdf
+Generative Slate Recommendation with Reinforcement.pdf
+
+# Documentation and conversation logs
+document/
+data/data_analysis/
+experiments/
+src/data_collection/offline_data_collection/model_tests/

@@ -120,3 +120,38 @@ class ReplayBuffer:
         """
         self._rewards = self._rewards * scale
         print(f"Rewards scaled by {scale}")
+
+    def normalize_actions(self, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        对动作进行 Min-Max 归一化到 [-1, 1] 范围
+        使用与在线 SAC 训练一致的归一化方式
+
+        公式 (与 online.py 第 478-480 行一致):
+            action_min = min(actions)
+            action_scale = (max(actions) - min(actions)) / 2
+            action_center = action_min + action_scale
+            action_normalized = (action - action_center) / action_scale
+
+        Returns:
+            action_center: 归一化中心点 (用于反归一化)
+            action_scale: 缩放比例 (用于反归一化)
+        """
+        actions = self._actions[:self._size]
+
+        # 计算每个维度的 min 和 max
+        action_min = actions.min(dim=0)[0]
+        action_max = actions.max(dim=0)[0]
+
+        # 计算 center 和 scale (与在线训练一致)
+        action_scale = (action_max - action_min) / 2 + eps
+        action_center = action_min + action_scale
+
+        # 执行归一化
+        self._actions[:self._size] = (self._actions[:self._size] - action_center) / action_scale
+
+        print(f"Actions normalized to [-1, 1]")
+        print(f"  Original range: [{action_min.min().item():.4f}, {action_max.max().item():.4f}]")
+        print(f"  Action center shape: {action_center.shape}")
+        print(f"  Action scale shape: {action_scale.shape}")
+
+        return action_center, action_scale

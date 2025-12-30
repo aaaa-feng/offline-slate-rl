@@ -29,8 +29,8 @@ DATASETS_ROOT = DATA_ROOT / "datasets"
 # 实验根目录
 EXPERIMENTS_ROOT = Path(os.getenv('OFFLINE_SLATE_RL_EXPERIMENTS_ROOT', PROJECT_ROOT / "experiments"))
 
-# 结果根目录
-RESULTS_ROOT = PROJECT_ROOT / "results"
+# 结果根目录（移动到 experiments 下）
+RESULTS_ROOT = EXPERIMENTS_ROOT / "test_results"
 
 # 在线RL结果目录
 ONLINE_RL_RESULTS_DIR = RESULTS_ROOT / "online_rl"

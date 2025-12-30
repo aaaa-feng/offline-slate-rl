@@ -35,7 +35,7 @@ from belief_encoders.gru_belief import BeliefEncoder, GRUBelief
 from rankers.gems.rankers import Ranker, TopKRanker, kHeadArgmaxRanker, GeMS
 from rankers.gems.item_embeddings import ItemEmbeddings, MFEmbeddings
 from training.online_loops import TrainingEpisodeLoop, ValEpisodeLoop, TestEpisodeLoop, ResettableFitLoop
-from common.logger import SwanlabLogger
+from common.online.logger import SwanlabLogger
 
 # Save original command line arguments for logging
 _original_argv = sys.argv.copy()
@@ -215,9 +215,31 @@ if is_pomdp:
                 ranker_checkpoint = main_args.ranker + "_" + args.ranker_dataset
             ranker_checkpoint += "_latentdim" + str(arg_dict["latent_dim"]) + "_beta" + str(arg_dict["lambda_KL"]) + "_lambdaclick" + str(arg_dict["lambda_click"]) + \
                                     "_lambdaprior" + str(arg_dict["lambda_prior"]) + "_" + args.ranker_embedds + "_seed" + str(args.ranker_seed)
-            ranker = ranker_class.load_from_checkpoint(str(get_gems_checkpoint_path(ranker_checkpoint)),
+
+            # Print GeMS loading information
+            gems_checkpoint_path = str(get_gems_checkpoint_path(ranker_checkpoint))
+            print("=" * 80)
+            print("=== Loading Pretrained GeMS Model ===")
+            print("=" * 80)
+            print(f"Checkpoint Name: {ranker_checkpoint}")
+            print(f"Checkpoint Path: {gems_checkpoint_path}")
+            print(f"Parameters:")
+            print(f"  - ranker_dataset: {args.ranker_dataset}")
+            print(f"  - latent_dim: {arg_dict['latent_dim']}")
+            print(f"  - lambda_KL (beta): {arg_dict['lambda_KL']}")
+            print(f"  - lambda_click: {arg_dict['lambda_click']}")
+            print(f"  - lambda_prior: {arg_dict['lambda_prior']}")
+            print(f"  - ranker_embedds: {args.ranker_embedds}")
+            print(f"  - ranker_seed: {args.ranker_seed}")
+            print("=" * 80)
+
+            ranker = ranker_class.load_from_checkpoint(gems_checkpoint_path,
                                                     map_location = args.device, item_embeddings = item_embeddings, **arg_dict)
             ranker.freeze()
+
+            print("✅ GeMS model loaded successfully and frozen!")
+            print("=" * 80)
+            print()
             print("Getting action bounds ...")
             if args.ranker_dataset is None :
                 dataset_name = args.click_model + "_" + args.logging_policy + "_10K"

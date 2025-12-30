@@ -35,6 +35,7 @@ class SlateInfo:
     episode_return: float                        # 累积奖励
     episode_id: int                              # 轨迹ID
     timestep: int                                # 时间步
+    item_relevances: Optional[torch.Tensor] = None  # Oracle信息：物品相关性 (num_items,)
 
 @dataclass
 class SlateTransition:
@@ -126,7 +127,14 @@ class SlateDataset:
         coverage_scores = []
         episode_ids = []
         timesteps = []
-        
+
+        # V2新增字段（向后兼容）
+        raw_observations = []
+        raw_next_observations = []
+        user_states = []
+        user_bored = []
+        item_relevances = []  # V3新增：Oracle信息
+
         for i, transition in enumerate(all_transitions):
             # 标准D4RL字段
             obs = transition.observation
@@ -164,6 +172,35 @@ class SlateDataset:
             coverage_scores.append(transition.info.coverage_score)
             episode_ids.append(transition.info.episode_id)
             timesteps.append(transition.info.timestep)
+
+            # V2新增：提取raw_obs（向后兼容，静默处理None）
+            if obs.raw_obs is not None:
+                raw_observations.append(obs.raw_obs)
+                # 提取用户状态
+                if 'user' in obs.raw_obs and 'user_state' in obs.raw_obs['user']:
+                    user_states.append(obs.raw_obs['user']['user_state'].cpu().numpy())
+                    user_bored.append(obs.raw_obs['user']['bored'].cpu().numpy())
+                else:
+                    # 如果raw_obs存在但结构不完整，填充默认值
+                    user_states.append(np.zeros(10))
+                    user_bored.append(np.zeros(10, dtype=bool))
+            else:
+                # 旧数据或默认模式：填充None和默认值
+                raw_observations.append(None)
+                user_states.append(np.zeros(10))
+                user_bored.append(np.zeros(10, dtype=bool))
+
+            if next_obs.raw_obs is not None:
+                raw_next_observations.append(next_obs.raw_obs)
+            else:
+                raw_next_observations.append(None)
+
+            # V3新增：提取Oracle信息（向后兼容）
+            if transition.info.item_relevances is not None:
+                item_relevances.append(transition.info.item_relevances.cpu().numpy())
+            else:
+                # 兼容旧数据：填充零向量
+                item_relevances.append(np.zeros(1000))  # 默认1000个物品
         
         # 转换为numpy数组
         d4rl_data = {
@@ -174,7 +211,7 @@ class SlateDataset:
             'next_observations': np.array(next_observations),
             'terminals': np.array(terminals),
             'timeouts': np.array(timeouts),
-            
+
             # Slate推荐特有字段
             'slates': np.array(slates),
             'clicks': np.array(clicks),
@@ -182,6 +219,15 @@ class SlateDataset:
             'coverage_scores': np.array(coverage_scores),
             'episode_ids': np.array(episode_ids),
             'timesteps': np.array(timesteps),
+
+            # V2新增字段（向后兼容）
+            'raw_observations': np.array(raw_observations, dtype=object),
+            'raw_next_observations': np.array(raw_next_observations, dtype=object),
+            'user_states': np.array(user_states),
+            'user_bored': np.array(user_bored),
+
+            # V3新增字段（Oracle信息）
+            'item_relevances': np.array(item_relevances),
         }
         
         return d4rl_data

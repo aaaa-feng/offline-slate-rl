@@ -70,6 +70,12 @@
 - `paths.py` - 项目路径配置
   - 定义所有数据、模型、日志的标准路径
   - 统一管理文件系统结构
+- `offline_config.py` - 离线RL算法配置 ⭐
+  - BC, TD3+BC, CQL, IQL 算法参数配置
+  - 自动路径生成和SwanLab配置
+  - 统一的配置管理接口
+- `reference_yaml/` - 参考配置模板
+  - `train_SAC+GeMS.yml` - 在线RL训练参数模板
 
 #### `scripts/` - 执行脚本
 - **`scripts/train_online_rl.py`** - 在线 RL 训练主脚本 ⭐
@@ -116,28 +122,36 @@
     - `*_step50000.ckpt` - 50k 步模型 (用于 Medium 数据收集)
     - `*_last.ckpt` - 最终模型
 
-- **`checkpoints/offline_rl/`** - 离线 RL 训练模型
-  - 离线算法训练的模型
-
-#### `results/` - 实验结果
-- **`results/online_rl/`** - 在线 RL 实验结果
-  - 测试结果 `.pt` 文件
-  - 性能指标统计
-
-- **`results/offline_rl/`** - 离线 RL 实验结果
+- **`checkpoints/offline_rl/`** - 离线 RL 训练模型 ⭐
+  - 按环境和算法组织: `{env_name}/{algo_name}/`
+  - 支持的算法: BC, TD3+BC, CQL, IQL
+  - 每个算法包含:
+    - `*_step{N}.pt` - 中间步数模型 (如 step50000, step100000)
+    - `*_final.pt` - 最终训练模型
+  - 模型保存内容: actor, critic, optimizer, action_center/scale, config
 
 ### 日志和文档目录
 
 #### `experiments/` - 实验记录
 - **`experiments/logs/`** - 训练日志 ⭐
-  - `log_58407201/SAC_GeMS/` - 主要实验日志 (seed 58407201)
+  - **在线RL日志**: `logs/online/log_58407201/SAC_GeMS/`
     - `replication_experiment_20251129/` - 复现实验 (12个实验)
-    - `medium_collection_20251206/` - Medium 数据收集训练 (6个实验,进行中)
-  - 包含完整的训练输出、验证结果、错误信息
+    - `medium_collection_20251206/` - Medium 数据收集训练 (6个实验)
+  - **离线RL日志**: `logs/offline/log_58407201/{algorithm}/` ⭐
+    - 按算法组织: BC/, TD3_BC/, CQL/, IQL/
+    - 每个算法下按实验名称组织
+    - 日志文件命名包含关键参数 (如 alpha, tau, beta)
+  - 包含完整的训练输出、数据集信息、训练进度
 
 - **`experiments/swanlog/`** - SwanLab 本地日志
   - SwanLab 云端同步的本地副本
   - 包含实验配置、指标、图表
+
+- **`experiments/test_results/`** - 测试结果 ⭐
+  - `test_results/online_rl/` - 在线 RL 测试结果
+    - 测试性能 `.pt` 文件
+    - 测试轨迹数据
+  - `test_results/offline_rl/` - 离线 RL 测试结果
 
 #### `document/` - 项目文档 📚
 - **操作指南**:
@@ -217,6 +231,58 @@
 **模型保存**: `checkpoints/online_rl/{env_name}/*_step50000.ckpt`
 
 **下一步**: 使用 50k 步模型收集 10,000 条轨迹/环境
+
+---
+
+## 🔄 离线RL架构 (Offline RL Architecture)
+
+### 支持的算法
+
+1. **BC (Behavior Cloning)** - 最简单的模仿学习baseline
+2. **TD3+BC** - TD3算法 + Behavior Cloning正则化
+3. **CQL (Conservative Q-Learning)** - 保守Q学习
+4. **IQL (Implicit Q-Learning)** - 隐式Q学习
+
+### 目录结构规范
+
+#### 1. 日志结构
+```
+experiments/logs/offline/log_{seed}/{algorithm}/{experiment_name}/
+```
+
+**示例**:
+```
+logs/offline/log_58407201/
+├── BC/baseline_experiment_20251227/
+├── TD3_BC/baseline_experiment_20251227/
+├── CQL/baseline_experiment_20251227/
+└── IQL/baseline_experiment_20251227/
+```
+
+#### 2. 模型存储
+```
+checkpoints/offline_rl/{env_name}/{algo_name}/
+```
+
+**命名规则**:
+- BC: `bc_{env_name}_{quality}_final.pt`
+- TD3+BC: `td3_bc_{env_name}_{quality}_alpha{alpha}_final.pt`
+- CQL: `cql_{env_name}_{quality}_alpha{alpha}_final.pt`
+- IQL: `iql_{env_name}_{quality}_tau{tau}_beta{beta}_final.pt`
+
+#### 3. SwanLab配置
+- **项目名称**: `GeMS_Offline_RL_202512`
+- **run_name**: `{Algo}_{env}_{quality}_{params}_seed{seed}`
+- **tags**: `[algo_name, env_name, dataset_quality, "seed_58407201"]`
+
+### 关键特性
+
+✅ **动作归一化**: 所有算法必须使用动作归一化到[-1,1]
+✅ **参数持久化**: 模型保存包含action_center/scale
+✅ **配置统一**: 使用`config/offline_config.py`统一管理
+✅ **架构对齐**: 与在线RL保持一致的目录结构
+
+**详细文档**: 参见 [document/offline_rl_architecture.md](document/offline_rl_architecture.md)
 
 ---
 
@@ -305,6 +371,26 @@
 | Params1 | 0.5 | 0.2 | 复现实验 | 探索性参数 |
 | Params2 | 1.0 | 0.5 | 复现实验 + Medium 收集 | 论文官方参数 ⭐ |
 
+### 表 6: 离线RL算法参数对照表
+
+| 算法 | 关键参数 | 默认值 | 说明 |
+|------|---------|--------|------|
+| **BC** | `learning_rate` | 3e-4 | 学习率 |
+| | `batch_size` | 256 | 批次大小 |
+| | `max_timesteps` | 1e6 | 最大训练步数 |
+| **TD3+BC** | `alpha` | 2.5 | BC正则化系数 ⭐ |
+| | `policy_noise` | 0.2 | 策略噪声 |
+| | `tau` | 0.005 | 软更新系数 |
+| | `gamma` | 0.99 | 折扣因子 |
+| **CQL** | `alpha` | 1.0 | CQL正则化系数 ⭐ |
+| | `cql_n_actions` | 10 | CQL采样动作数 |
+| | `cql_min_q_weight` | 5.0 | CQL最小Q权重 |
+| **IQL** | `tau` | 0.7 | 期望分位数 ⭐ |
+| | `beta` | 3.0 | 优势加权系数 ⭐ |
+| | `gamma` | 0.99 | 折扣因子 |
+
+**注**: 所有算法都必须使用动作归一化 (`normalize_actions=True`)
+
 ---
 
 ## 🚀 快速开始
@@ -373,41 +459,80 @@ python scripts/collect_offline_data.py \
     --output_path=data/offline_datasets/medium/focused_topdown_medium_10000traj.pkl
 ```
 
+### 训练离线RL算法
+
+```bash
+# 训练 BC (Behavior Cloning)
+python src/agents/offline/bc.py \
+    --env_name=diffuse_mix \
+    --dataset_path=data/datasets/offline/diffuse_mix/expert_data_d4rl.npz \
+    --seed=58407201 \
+    --device=cuda \
+    --max_timesteps=100000 \
+    --batch_size=256
+```
+
+**注**: 离线RL训练会自动:
+- 归一化动作到[-1,1]范围
+- 保存归一化参数到模型checkpoint
+- 上传日志到SwanLab项目 `GeMS_Offline_RL_202512`
+
 ---
 
 ## 📈 监控和日志
 
 ### SwanLab 云端监控
 
-**项目链接**: [https://swanlab.cn/@Cliff/GeMS_RL_Training_202512](https://swanlab.cn/@Cliff/GeMS_RL_Training_202512)
+**在线RL项目**: [GeMS_RL_Training_202512](https://swanlab.cn/@Cliff/GeMS_RL_Training_202512)
+- 监控指标: train_reward, val_reward, train_ep_length
+- Loss 曲线: Q-loss, Policy-loss, Alpha-loss
 
-**监控指标**:
-- `train_reward` - 训练 reward
-- `val_reward` - 验证 reward
-- `train_ep_length` - Episode 长度
-- Loss 曲线 (Q-loss, Policy-loss, Alpha-loss)
+**离线RL项目**: [GeMS_Offline_RL_202512](https://swanlab.cn/@Cliff/GeMS_Offline_RL_202512) ⭐
+- 监控指标: bc_loss, actor_loss, critic_loss
+- 训练进度: action_mean, action_std
+- 算法特定指标: CQL penalty, IQL advantage weights
 
 ### 本地日志查看
 
+**在线RL日志**:
 ```bash
 # 查看训练进度
-grep "Training Step" experiments/logs/log_58407201/SAC_GeMS/medium_collection_20251206/*.log | tail -20
+grep "Training Step" experiments/logs/online/log_58407201/SAC_GeMS/medium_collection_20251206/*.log | tail -20
 
 # 查看验证结果
-grep "VALIDATION" experiments/logs/log_58407201/SAC_GeMS/medium_collection_20251206/*.log | tail -20
+grep "VALIDATION" experiments/logs/online/log_58407201/SAC_GeMS/medium_collection_20251206/*.log | tail -20
 
 # 实时监控
-tail -f experiments/logs/log_58407201/SAC_GeMS/medium_collection_20251206/focused_topdown_*.log
+tail -f experiments/logs/online/log_58407201/SAC_GeMS/medium_collection_20251206/focused_topdown_*.log
+```
+
+**离线RL日志**:
+```bash
+# 查看BC训练进度
+grep "Step" experiments/logs/offline/log_58407201/BC/baseline_experiment_*/diffuse_mix_*.log | tail -20
+
+# 实时监控离线训练
+tail -f experiments/logs/offline/log_58407201/BC/baseline_experiment_*/diffuse_mix_*.log
 ```
 
 ### 检查模型保存
 
+**在线RL模型**:
 ```bash
 # 查看所有 50k 步模型
 ls -lh checkpoints/online_rl/*/SAC+GeMS_Medium_*_step50000.ckpt
 
 # 查看特定环境的所有模型
 ls -lh checkpoints/online_rl/focused_topdown/
+```
+
+**离线RL模型**:
+```bash
+# 查看BC模型
+ls -lh checkpoints/offline_rl/diffuse_mix/bc/
+
+# 查看所有离线算法的模型
+ls -lh checkpoints/offline_rl/*/
 ```
 
 ---
@@ -418,6 +543,7 @@ ls -lh checkpoints/online_rl/focused_topdown/
 - [Medium 数据收集操作指南](document/conversation_2025-12-06_session1.md) - 详细的数据收集流程
 - [实验执行指南](document/EXPERIMENT_GUIDE.md) - 如何运行实验
 - [数据和工作流说明](document/DATA_AND_WORKFLOW_EXPLANATION.md) - 数据流程说明
+- [离线RL架构文档](document/offline_rl_architecture.md) - 离线RL完整架构说明 ⭐
 
 ### 实验分析
 - [完整项目分析报告](document/COMPLETE_PROJECT_ANALYSIS_REPORT.md) - 项目全面分析

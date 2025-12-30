@@ -1,0 +1,64 @@
+{
+  "quality_level": "expert",
+  "description": "Expert quality models for offline data collection",
+  "refactored_date": "2025-12-30",
+  "models": {
+    "diffuse_topdown": {
+      "filename": "sac_gems_models/diffuse_topdown/SAC_GeMS_diffuse_topdown_expert_beta0.5_click0.2_div1.0_gamma0.8_dim32_seed58407201.ckpt",
+      "original_path": "/data/liyuefeng/offline-slate-rl/src/data_collection/offline_data_collection/models/expert/sac_gems_models/diffuse_topdown/SAC+GeMS_GeMS_diffuse_topdown_latentdim32_beta0.5_lambdaclick0.2_lambdaprior0.0_scratch_seed58407201_agentseed58407201_gamma0.8.ckpt",
+      "parameters": {
+        "beta": 0.5,
+        "lambda_click": 0.2,
+        "latent_dim": 32,
+        "seed": 58407201,
+        "gamma": 0.8
+      },
+      "env_config": {
+        "click_model": "tdPBM",
+        "diversity_penalty": 1.0,
+        "item_embedd_dim": 20,
+        "belief_state_dim": 20,
+        "num_items": 1000,
+        "rec_size": 10
+      }
+    },
+    "diffuse_mix": {
+      "filename": "sac_gems_models/diffuse_mix/SAC_GeMS_diffuse_mix_expert_beta1.0_click0.5_div1.0_gamma0.8_dim32_seed58407201.ckpt",
+      "original_path": "/data/liyuefeng/offline-slate-rl/src/data_collection/offline_data_collection/models/expert/sac_gems_models/diffuse_mix/SAC+GeMS_Medium_GeMS_diffuse_mix_latentdim32_beta1.0_lambdaclick0.5_lambdaprior0.0_scratch_seed58407201_agentseed58407201_gamma0.8_best-v1.ckpt",
+      "parameters": {
+        "beta": 1.0,
+        "lambda_click": 0.5,
+        "latent_dim": 32,
+        "seed": 58407201,
+        "gamma": 0.8
+      },
+      "env_config": {
+        "click_model": "mixPBM",
+        "diversity_penalty": 1.0,
+        "item_embedd_dim": 20,
+        "belief_state_dim": 20,
+        "num_items": 1000,
+        "rec_size": 10
+      }
+    },
+    "diffuse_divpen": {
+      "filename": "sac_gems_models/diffuse_divpen/SAC_GeMS_diffuse_divpen_expert_beta1.0_click0.5_div3.0_gamma0.8_dim32_seed58407201.ckpt",
+      "original_path": "/data/liyuefeng/offline-slate-rl/src/data_collection/offline_data_collection/models/expert/sac_gems_models/diffuse_divpen/SAC+GeMS_Medium_GeMS_diffuse_divpen_latentdim32_beta1.0_lambdaclick0.5_lambdaprior0.0_scratch_seed58407201_agentseed58407201_gamma0.8_best-v1.ckpt",
+      "parameters": {
+        "beta": 1.0,
+        "lambda_click": 0.5,
+        "latent_dim": 32,
+        "seed": 58407201,
+        "gamma": 0.8
+      },
+      "env_config": {
+        "click_model": "mixPBM",
+        "diversity_penalty": 3.0,
+        "item_embedd_dim": 20,
+        "belief_state_dim": 20,
+        "num_items": 1000,
+        "rec_size": 10
+      }
+    }
+  }
+}
