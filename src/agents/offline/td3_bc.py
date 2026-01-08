@@ -14,7 +14,7 @@ import os
 import sys
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -32,10 +32,12 @@ sys.path.insert(0, str(PROJECT_ROOT.parent))
 from config import paths
 from config.offline_config import TD3BCConfig, auto_generate_paths, auto_generate_swanlab_config
 
-from common.offline.buffer import ReplayBuffer
+from common.offline.buffer import ReplayBuffer, TrajectoryReplayBuffer
 from common.offline.utils import set_seed, compute_mean_std, soft_update
 from common.offline.networks import Actor, Critic
 from common.offline.eval_env import OfflineEvalEnv
+from belief_encoders.gru_belief import GRUBelief
+from rankers.gems.item_embeddings import ItemEmbeddings
 
 # SwanLab Logger import (离线RL专用版本)
 try:
@@ -68,93 +70,175 @@ TensorBatch = List[torch.Tensor]
 
 
 class TD3_BC:
-    """TD3+BC algorithm with enhanced monitoring"""
+    """TD3+BC algorithm with Dual-Stream End-to-End GRU (GeMS-aligned)"""
 
     def __init__(
         self,
-        state_dim: int,
         action_dim: int,
-        max_action: float,
         config: TD3BCConfig,
-        action_center: torch.Tensor = None,  # 新增
-        action_scale: torch.Tensor = None,   # 新增
+        ranker_params: Dict,  # 🔥 GeMS-aligned: 接收 Ranker 参数
     ):
         self.config = config
         self.device = torch.device(config.device)
-        self.max_action = max_action
+        self.action_dim = action_dim
+        self.max_action = 1.0  # 归一化后固定为 1.0
 
-        # 归一化参数 (保存在 agent 中,不参与梯度更新)
-        if action_center is not None:
-            self.action_center = action_center.to(self.device)
-            self.action_scale = action_scale.to(self.device)
-        else:
-            self.action_center = torch.zeros(action_dim, device=self.device)
-            self.action_scale = torch.ones(action_dim, device=self.device)
+        # ========================================================================
+        # 🔥 关键：从 Ranker 参数中提取组件（复刻 BC 逻辑）
+        # ========================================================================
 
-        # Initialize networks
-        self.actor = Actor(state_dim, action_dim, max_action, config.hidden_dim).to(self.device)
+        # 1. Action Bounds（直接使用 Ranker 的）
+        self.action_center = ranker_params['action_center'].to(self.device)
+        self.action_scale = ranker_params['action_scale'].to(self.device)
+        logging.info("=" * 80)
+        logging.info("=== Action Bounds from GeMS ===")
+        logging.info(f"  center shape: {self.action_center.shape}")
+        logging.info(f"  center mean: {self.action_center.mean().item():.6f}")
+        logging.info(f"  scale shape: {self.action_scale.shape}")
+        logging.info(f"  scale mean: {self.action_scale.mean().item():.6f}")
+        logging.info("=" * 80)
+
+        # 2. Item Embeddings（使用 GeMS 训练后的）
+        self.item_embeddings = ranker_params['item_embeddings']
+        logging.info(f"Item embeddings from GeMS: {self.item_embeddings.num_items} items, "
+                    f"{self.item_embeddings.embedd_dim} dims")
+
+        # 3. 初始化双流 GRU belief encoder (CRITICAL: beliefs=["actor", "critic"])
+        logging.info("Initializing Dual-Stream GRU belief encoder...")
+        input_dim = config.rec_size * (config.item_embedd_dim + 1)
+
+        self.belief = GRUBelief(
+            item_embeddings=self.item_embeddings,  # 🔥 传入 GeMS 的 Embeddings
+            belief_state_dim=config.belief_hidden_dim,
+            item_embedd_dim=config.item_embedd_dim,
+            rec_size=config.rec_size,
+            ranker=None,
+            device=self.device,
+            belief_lr=0.0,
+            hidden_layers_reduction=[],
+            beliefs=["actor", "critic"],  # DUAL-STREAM ARCHITECTURE
+            hidden_dim=config.belief_hidden_dim,
+            input_dim=input_dim  # 🔥 显式传入
+        )
+
+        # 4. 🔥 关键：双重保险 - 再次冻结 Embeddings
+        for module in self.belief.item_embeddings:
+            self.belief.item_embeddings[module].freeze()
+        logging.info("✅ Item embeddings frozen (double-checked)")
+
+        # Initialize Actor network
+        self.actor = Actor(
+            state_dim=config.belief_hidden_dim,
+            action_dim=action_dim,
+            max_action=self.max_action,
+            hidden_dim=config.hidden_dim
+        ).to(self.device)
         self.actor_target = copy.deepcopy(self.actor)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config.learning_rate)
 
-        self.critic_1 = Critic(state_dim, action_dim, config.hidden_dim).to(self.device)
+        # Initialize Critic networks
+        self.critic_1 = Critic(
+            state_dim=config.belief_hidden_dim,
+            action_dim=action_dim,
+            hidden_dim=config.hidden_dim
+        ).to(self.device)
         self.critic_1_target = copy.deepcopy(self.critic_1)
-        self.critic_1_optimizer = torch.optim.Adam(self.critic_1.parameters(), lr=config.learning_rate)
 
-        self.critic_2 = Critic(state_dim, action_dim, config.hidden_dim).to(self.device)
+        self.critic_2 = Critic(
+            state_dim=config.belief_hidden_dim,
+            action_dim=action_dim,
+            hidden_dim=config.hidden_dim
+        ).to(self.device)
         self.critic_2_target = copy.deepcopy(self.critic_2)
-        self.critic_2_optimizer = torch.optim.Adam(self.critic_2.parameters(), lr=config.learning_rate)
+
+        # CRITICAL: 分离优化器 (Actor + Actor GRU) vs (Critics + Critic GRU)
+        self.actor_optimizer = torch.optim.Adam([
+            {'params': self.belief.gru["actor"].parameters()},
+            {'params': self.actor.parameters()}
+        ], lr=config.actor_lr)
+
+        self.critic_optimizer = torch.optim.Adam([
+            {'params': self.belief.gru["critic"].parameters()},
+            {'params': self.critic_1.parameters()},
+            {'params': self.critic_2.parameters()}
+        ], lr=config.critic_lr)
 
         self.total_it = 0
+        logging.info("TD3_BC initialized with Dual-Stream E2E GRU")
 
-    def train(self, batch: TensorBatch) -> Dict[str, float]:
-        """Train one step with comprehensive metrics"""
+    def train(self, batch) -> Dict[str, float]:
+        """
+        训练一步 (双流端到端训练: Actor GRU + Critic GRU)
+
+        Args:
+            batch: TrajectoryBatch with obs, actions, rewards, dones
+        """
         self.total_it += 1
-        state, action, reward, next_state, done = batch
 
-        # Critic training
+        # Step 1: 双流 GRU 前向传播
+        states, next_states = self.belief.forward_batch(batch)
+        s_actor = states["actor"]  # [sum_seq_lens, belief_hidden_dim]
+        s_critic = states["critic"]  # [sum_seq_lens, belief_hidden_dim]
+        ns_actor = next_states["actor"]  # [sum_seq_lens, belief_hidden_dim]
+        ns_critic = next_states["critic"]  # [sum_seq_lens, belief_hidden_dim]
+
+        # Step 2: Concatenate trajectory data
+        true_actions = torch.cat(batch.actions, dim=0)  # [sum_seq_lens, action_dim]
+        rewards = torch.cat(batch.rewards, dim=0) if batch.rewards else None
+        dones = torch.cat(batch.dones, dim=0) if batch.dones else None
+
+        # Step 3: Critic Update (TD3 Loss)
         with torch.no_grad():
-            # Select action according to policy and add clipped noise
-            noise = (torch.randn_like(action) * self.config.policy_noise).clamp(
+            # 使用 Actor GRU 的 next_state 生成 next_action
+            noise = (torch.randn_like(true_actions) * self.config.policy_noise).clamp(
                 -self.config.noise_clip, self.config.noise_clip
             )
-            next_action = (self.actor_target(next_state) + noise).clamp(
+            next_action = (self.actor_target(ns_actor) + noise).clamp(
                 -self.max_action, self.max_action
             )
 
-            # Compute the target Q value
-            target_q1 = self.critic_1_target.q1(next_state, next_action)
-            target_q2 = self.critic_2_target.q1(next_state, next_action)
+            # 使用 Critic GRU 的 next_state 计算 target Q
+            target_q1 = self.critic_1_target.q1(ns_critic, next_action)
+            target_q2 = self.critic_2_target.q1(ns_critic, next_action)
             target_q = torch.min(target_q1, target_q2)
-            target_q = reward + (1 - done) * self.config.gamma * target_q
 
-        # Get current Q estimates
-        current_q1 = self.critic_1.q1(state, action)
-        current_q2 = self.critic_2.q1(state, action)
+            if rewards is not None and dones is not None:
+                target_q = rewards + (1 - dones) * self.config.gamma * target_q
+            else:
+                # 如果没有 reward/done，使用简化版本
+                target_q = target_q * self.config.gamma
 
-        # Compute critic loss
+        # 使用 Critic GRU 的 current_state 计算 current Q
+        # Detach s_critic to avoid gradient conflict (Critic optimizer doesn't include GRU)
+        current_q1 = self.critic_1.q1(s_critic.detach(), true_actions)
+        current_q2 = self.critic_2.q1(s_critic.detach(), true_actions)
+
+        # Critic loss
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
-        # Optimize critics
-        self.critic_1_optimizer.zero_grad()
-        self.critic_2_optimizer.zero_grad()
+        # Optimize Critic + Critic GRU
+        self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        self.critic_1_optimizer.step()
-        self.critic_2_optimizer.step()
+        self.critic_optimizer.step()
 
-        # Delayed policy updates
+        # Step 4: Actor Update (TD3+BC Loss) - Delayed
         actor_loss = None
         bc_loss = None
         if self.total_it % self.config.policy_freq == 0:
-            # Compute actor loss
-            pi = self.actor(state)
-            q = self.critic_1.q1(state, pi)
+            # 使用 Actor GRU 的 state 生成 action
+            pi = self.actor(s_actor)
+
+            # CRITICAL: 使用 detached Critic GRU state 计算 Q 值
+            # 这样梯度不会流回 Critic GRU
+            q = self.critic_1.q1(s_critic.detach(), pi)
             lmbda = self.config.alpha / q.abs().mean().detach()
 
             # BC loss (单独记录)
-            bc_loss = F.mse_loss(pi, action)
+            bc_loss = F.mse_loss(pi, true_actions)
+
+            # TD3+BC loss
             actor_loss = -lmbda * q.mean() + bc_loss
 
-            # Optimize actor
+            # Optimize Actor + Actor GRU
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
@@ -178,40 +262,133 @@ class TD3_BC:
         }
 
     @torch.no_grad()
-    def act(self, state: np.ndarray, deterministic: bool = True) -> np.ndarray:
-        """Select action"""
-        state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
-        action = self.actor(state)
-        return action.cpu().data.numpy().flatten()
+    def act(self, obs: Dict[str, Any], deterministic: bool = True) -> np.ndarray:
+        """
+        选择动作 (使用 Actor GRU 编码 + Actor 预测 + 反归一化)
+
+        Args:
+            obs: Dict with 'slate' and 'clicks' (torch.Tensor or numpy arrays)
+            deterministic: 是否确定性选择 (TD3+BC 总是确定性的)
+
+        Returns:
+            action: 反归一化后的动作
+        """
+        # 统一转为 Tensor (无 Batch 维度)
+        slate = torch.as_tensor(obs["slate"], dtype=torch.long, device=self.device)
+        clicks = torch.as_tensor(obs["clicks"], dtype=torch.long, device=self.device)
+
+        # 构造输入 (不加 unsqueeze(0)!)
+        obs_tensor = {"slate": slate, "clicks": clicks}
+
+        # 只使用 Actor GRU 编码 (推理时不需要 Critic)
+        belief_state = self.belief.forward(obs_tensor, done=False)["actor"]
+
+        # Actor 预测
+        raw_action = self.actor(belief_state)  # [1, action_dim]
+
+        # 反归一化
+        action = raw_action * self.action_scale + self.action_center
+        action = action.cpu().numpy().flatten()
+
+        return action
+
+    def reset_hidden(self):
+        """
+        重置双流 GRU 隐藏状态 (在每个 episode 开始时调用)
+        使用 dummy obs + done=True 来优雅地重置
+        """
+        dummy_obs = {
+            "slate": torch.zeros((1, self.config.rec_size), dtype=torch.long, device=self.device),
+            "clicks": torch.zeros((1, self.config.rec_size), dtype=torch.long, device=self.device)
+        }
+        self.belief.forward(dummy_obs, done=True)
 
     def save(self, filepath: str):
-        """Save model (包含归一化参数)"""
+        """保存模型（包含所有必要信息，支持独立加载）"""
         torch.save({
-            'actor': self.actor.state_dict(),
-            'critic_1': self.critic_1.state_dict(),
-            'critic_2': self.critic_2.state_dict(),
+            'belief_state_dict': self.belief.state_dict(),
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_1_state_dict': self.critic_1.state_dict(),
+            'critic_2_state_dict': self.critic_2.state_dict(),
             'actor_optimizer': self.actor_optimizer.state_dict(),
-            'critic_1_optimizer': self.critic_1_optimizer.state_dict(),
-            'critic_2_optimizer': self.critic_2_optimizer.state_dict(),
-            'action_center': self.action_center,  # 新增
-            'action_scale': self.action_scale,    # 新增
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+            'action_center': self.action_center,
+            'action_scale': self.action_scale,
+            'embeddings_meta': {
+                'num_items': self.item_embeddings.num_items,
+                'embedd_dim': self.item_embeddings.embedd_dim,
+            },
+            'action_dim': self.action_dim,
             'total_it': self.total_it,
+            'config': self.config,
         }, filepath)
-        logging.info(f"Model saved to {filepath}")
+        logging.info(f"✅ Model saved to {filepath} (with embeddings_meta)")
 
     def load(self, filepath: str):
-        """Load model (包含归一化参数)"""
+        """加载模型 (包含双流 GRU + Actor + Critics + 归一化参数)"""
         checkpoint = torch.load(filepath, map_location=self.device)
-        self.actor.load_state_dict(checkpoint['actor'])
-        self.critic_1.load_state_dict(checkpoint['critic_1'])
-        self.critic_2.load_state_dict(checkpoint['critic_2'])
+        self.belief.load_state_dict(checkpoint['belief_state_dict'])
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic_1.load_state_dict(checkpoint['critic_1_state_dict'])
+        self.critic_2.load_state_dict(checkpoint['critic_2_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
-        self.critic_1_optimizer.load_state_dict(checkpoint['critic_1_optimizer'])
-        self.critic_2_optimizer.load_state_dict(checkpoint['critic_2_optimizer'])
-        self.action_center = checkpoint['action_center']  # 新增
-        self.action_scale = checkpoint['action_scale']    # 新增
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        self.action_center = checkpoint['action_center']
+        self.action_scale = checkpoint['action_scale']
         self.total_it = checkpoint['total_it']
         logging.info(f"Model loaded from {filepath}")
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: str, device: str = "cuda"):
+        """从 Checkpoint 独立加载，无需 GeMS"""
+        logging.info("=" * 80)
+        logging.info("=== Loading TD3_BC from Checkpoint (Standalone) ===")
+        logging.info(f"Checkpoint: {checkpoint_path}")
+        logging.info("=" * 80)
+
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        # 1. 恢复 Embeddings
+        embeddings_meta = checkpoint['embeddings_meta']
+        belief_state = checkpoint['belief_state_dict']
+        embedding_weights = belief_state['item_embeddings.actor.embedd.weight']
+
+        agent_embeddings = ItemEmbeddings(
+            num_items=embeddings_meta['num_items'],
+            item_embedd_dim=embeddings_meta['embedd_dim'],
+            device=device,
+            weights=embedding_weights
+        )
+        logging.info(f"✅ Embeddings restored: {embeddings_meta['num_items']} items")
+
+        # 2. 构建 ranker_params
+        ranker_params = {
+            'item_embeddings': agent_embeddings,
+            'action_center': checkpoint['action_center'],
+            'action_scale': checkpoint['action_scale'],
+            'num_items': embeddings_meta['num_items'],
+            'item_embedd_dim': embeddings_meta['embedd_dim']
+        }
+
+        # 3. 创建 Agent
+        agent = cls(
+            action_dim=checkpoint['action_dim'],
+            config=checkpoint['config'],
+            ranker_params=ranker_params
+        )
+
+        # 4. 加载权重
+        agent.belief.load_state_dict(belief_state)
+        agent.actor.load_state_dict(checkpoint['actor_state_dict'])
+        agent.critic_1.load_state_dict(checkpoint['critic_1_state_dict'])
+        agent.critic_2.load_state_dict(checkpoint['critic_2_state_dict'])
+        agent.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+        agent.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        agent.total_it = checkpoint['total_it']
+
+        logging.info(f"✅ TD3_BC loaded from {checkpoint_path} (standalone)")
+        logging.info("=" * 80)
+        return agent
 
 
 def train_td3_bc(config: TD3BCConfig):
@@ -297,75 +474,202 @@ def train_td3_bc(config: TD3BCConfig):
     logging.info(f"Checkpoint dir: {config.checkpoint_dir}")
     logging.info("=" * 80)
 
-    # Load dataset
-    logging.info(f"\nLoading GeMS dataset from: {config.dataset_path}")
-    dataset = np.load(config.dataset_path)
+    # ========================================================================
+    # 🔥 关键：加载 GeMS 并提取组件（复刻 BC 逻辑）
+    # ========================================================================
+    from rankers.gems.rankers import GeMS
 
-    # Print dataset statistics
-    logging.info(f"Dataset statistics:")
-    logging.info(f"  Observations shape: {dataset['observations'].shape}")
-    logging.info(f"  Actions shape: {dataset['actions'].shape}")
-    logging.info(f"  Total transitions: {len(dataset['observations'])}")
-    logging.info(f"  Num episodes: {dataset['terminals'].sum()}")
-    logging.info(f"  Avg reward: {dataset['rewards'].mean():.4f}")
-    logging.info(f"  Reward std: {dataset['rewards'].std():.4f}")
-
-    # Get dimensions
-    state_dim = dataset['observations'].shape[1]
-    action_dim = dataset['actions'].shape[1]
-    max_action = 1.0  # 归一化后固定为 1.0 (关键修改!)
-
-    logging.info(f"\nEnvironment info:")
-    logging.info(f"  State dim: {state_dim}")
-    logging.info(f"  Action dim: {action_dim}")
-    logging.info(f"  Max action: {max_action} (normalized)")
-
-    # Create replay buffer
-    replay_buffer = ReplayBuffer(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        buffer_size=len(dataset['observations']),
-        device=config.device
+    # 1. 构建 GeMS Checkpoint 路径
+    gems_checkpoint_name = (
+        f"GeMS_{config.env_name}_{config.dataset_quality}_"
+        f"latent32_beta1.0_click0.5_seed58407201"
+    )
+    gems_path = (
+        f"/data/liyuefeng/offline-slate-rl/checkpoints/gems/offline/"
+        f"{gems_checkpoint_name}.ckpt"
     )
 
-    # Load data into buffer
-    dataset_dict = {
-        'observations': dataset['observations'],
-        'actions': dataset['actions'],
-        'rewards': dataset['rewards'],
-        'next_observations': dataset['next_observations'],
-        'terminals': dataset['terminals'],
+    logging.info("=" * 80)
+    logging.info("=== Loading Pretrained GeMS ===")
+    logging.info(f"Checkpoint: {gems_path}")
+
+    # 2. 加载 GeMS Ranker
+    temp_embeddings = ItemEmbeddings.from_pretrained(
+        config.item_embedds_path,
+        config.device
+    )
+
+    ranker = GeMS.load_from_checkpoint(
+        gems_path,
+        map_location=config.device,
+        item_embeddings=temp_embeddings,
+        device=config.device,
+        rec_size=config.rec_size,
+        item_embedd_dim=config.item_embedd_dim,
+        num_items=config.num_items,
+        latent_dim=32,
+        lambda_click=0.5,
+        lambda_KL=1.0,
+        lambda_prior=1.0,
+        ranker_lr=3e-3,
+        fixed_embedds="scratch",
+        ranker_sample=False,
+        hidden_layers_infer=[512, 256],
+        hidden_layers_decoder=[256, 512]
+    )
+    ranker.eval()
+    ranker.freeze()
+    logging.info("✅ GeMS loaded and frozen")
+
+    # 显式强制设备同步 (对标 eval_env.py 和 iql.py)
+    ranker = ranker.to(config.device)
+    logging.info(f"✅ GeMS moved to {config.device}")
+
+    # 3. 提取 GeMS 训练后的 Embeddings
+    gems_embedding_weights = ranker.item_embeddings.weight.data.clone()
+
+    agent_embeddings = ItemEmbeddings(
+        num_items=ranker.item_embeddings.num_embeddings,
+        item_embedd_dim=ranker.item_embeddings.embedding_dim,
+        device=config.device,
+        weights=gems_embedding_weights
+    )
+
+    # 4. 提前冻结
+    for param in agent_embeddings.parameters():
+        param.requires_grad = False
+    logging.info("✅ Agent embeddings created and frozen")
+
+    # 5. 准备 Ranker 参数包
+    ranker_params = {
+        'item_embeddings': agent_embeddings,
+        'action_center': ranker.action_center,
+        'action_scale': ranker.action_scale,
+        'num_items': ranker.num_items,
+        'item_embedd_dim': ranker.item_embedd_dim
     }
+    logging.info("=" * 80)
+
+    # ========================================================================
+    # 加载数据集
+    # ========================================================================
+    # Load dataset
+    logging.info(f"\nLoading dataset from: {config.dataset_path}")
+    dataset = np.load(config.dataset_path)
+
+    logging.info(f"Dataset statistics:")
+    logging.info(f"  Slates shape: {dataset['slates'].shape}")
+    logging.info(f"  Clicks shape: {dataset['clicks'].shape}")
+    logging.info(f"  Actions shape: {dataset['actions'].shape}")
+    logging.info(f"  Total transitions: {len(dataset['slates'])}")
+
+    # ========================================================================
+    # 内存重打标 (In-Memory Action Relabeling) - Zero Trust Strategy
+    # ========================================================================
+    logging.info("")
+    logging.info("=" * 80)
+    logging.info("⚠️  IN-MEMORY ACTION RELABELING")
+    logging.info("=" * 80)
+    logging.info("Strategy: Zero Trust - Regenerate all actions using current GeMS")
+    logging.info("Reason:   Ensure absolute consistency between training and inference")
+
+    # 1. Extract raw discrete data
+    raw_slates = torch.tensor(dataset['slates'], device=config.device, dtype=torch.long)
+    raw_clicks = torch.tensor(dataset['clicks'], device=config.device, dtype=torch.float)
+    total_samples = len(raw_slates)
+
+    # 2. Batch inference to regenerate actions
+    batch_size = 1000
+    new_actions_list = []
+
+    with torch.no_grad():
+        for i in range(0, total_samples, batch_size):
+            batch_slates = raw_slates[i:i+batch_size]
+            batch_clicks = raw_clicks[i:i+batch_size]
+
+            # Key: Use current GeMS Encoder to infer latent actions
+            mu, _ = ranker.run_inference(batch_slates, batch_clicks)
+            new_actions_list.append(mu.cpu().numpy())
+
+            if (i + batch_size) % 100000 == 0 or (i + batch_size) >= total_samples:
+                processed = min(i + batch_size, total_samples)
+                logging.info(f"  Progress: {processed:,}/{total_samples:,}")
+
+    new_actions = np.concatenate(new_actions_list, axis=0)
+
+    # 3. Action statistics validation
+    logging.info("Action Statistics (Primary Quality Indicator):")
+    logging.info(f"  Mean:  {new_actions.mean():.6f} (expect ≈ 0)")
+    logging.info(f"  Std:   {new_actions.std():.6f}  (expect ≈ 1)")
+    logging.info(f"  Min:   {new_actions.min():.6f}")
+    logging.info(f"  Max:   {new_actions.max():.6f}")
+
+    # 4. GeMS reconstruction quality test (Informational only, no blocking)
+    logging.info("")
+    logging.info("GeMS Reconstruction Quality Test (Informational Only):")
+    test_size = min(100, len(raw_slates))
+    test_slates = raw_slates[:test_size]
+    test_clicks = raw_clicks[:test_size]
+    with torch.no_grad():
+        test_actions, _ = ranker.run_inference(test_slates, test_clicks)
+        # Loop decoding (ranker.rank does not support batch input)
+        matches_list = []
+        for i in range(test_size):
+            reconstructed = ranker.rank(test_actions[i])
+            match = (test_slates[i] == reconstructed).float().mean().item()
+            matches_list.append(match)
+        matches = np.mean(matches_list)
+    logging.info(f"  Exact match accuracy: {matches:.4f}")
+    logging.info("  Note: Low accuracy is normal for slate ranking tasks")
+
+    # 5. Overwrite old actions
+    logging.info("")
+    logging.info("✅ Action relabeling complete. Overwriting dataset actions.")
+    logging.info("=" * 80)
+    logging.info("")
+
+    # Get dimensions
+    action_dim = dataset['actions'].shape[1]
+
+    logging.info(f"\nEnvironment info:")
+    logging.info(f"  Action dim: {action_dim}")
+    logging.info(f"  Rec size: {config.rec_size}")
+    logging.info(f"  Belief hidden dim: {config.belief_hidden_dim}")
+
+    # Create trajectory replay buffer
+    replay_buffer = TrajectoryReplayBuffer(device=config.device)
+
+    # 6. Load data with relabeled actions
+    dataset_dict = {
+        'episode_ids': dataset['episode_ids'],
+        'slates': dataset['slates'],
+        'clicks': dataset['clicks'],
+        'actions': new_actions,  # Use relabeled actions!
+    }
+
+    # 可选字段
+    if 'rewards' in dataset:
+        dataset_dict['rewards'] = dataset['rewards']
+    if 'terminals' in dataset:
+        dataset_dict['terminals'] = dataset['terminals']
+
     replay_buffer.load_d4rl_dataset(dataset_dict)
+    logging.info(f"✅ Buffer loaded successfully")
 
-    # Normalize states if needed
-    state_mean, state_std = 0.0, 1.0
-    if config.normalize_states:
-        state_mean, state_std = compute_mean_std(dataset['observations'])
-        replay_buffer.normalize_states(state_mean, state_std)
-        logging.info(f"States normalized")
+    # 🔥 关键：从 Buffer 计算 Action Bounds
+    logging.info("Calculating action bounds from buffer...")
+    action_center, action_scale = replay_buffer.get_action_normalization_params()
+    logging.info(f"✅ Action bounds calculated from buffer")
 
-    # Normalize rewards if needed
-    if config.normalize_rewards:
-        reward_mean = dataset['rewards'].mean()
-        reward_std = dataset['rewards'].std()
-        replay_buffer.normalize_rewards(reward_mean, reward_std)
-        logging.info(f"Rewards normalized (mean={reward_mean:.4f}, std={reward_std:.4f})")
+    # 更新 ranker_params 中的 action bounds
+    ranker_params['action_center'] = action_center
+    ranker_params['action_scale'] = action_scale
 
-    # === 关键: Action normalization (必须为True!) ===
-    if not config.normalize_actions:
-        raise ValueError("normalize_actions must be True for offline RL!")
-    action_center, action_scale = replay_buffer.normalize_actions()
-    logging.info(f"Actions normalized to [-1, 1]")
-
-    # Initialize TD3+BC
+    # Initialize TD3+BC agent (with Dual-Stream E2E GRU)
     agent = TD3_BC(
-        state_dim=state_dim,
         action_dim=action_dim,
-        max_action=max_action,
         config=config,
-        action_center=action_center,  # 新增
-        action_scale=action_scale,    # 新增
+        ranker_params=ranker_params,  # 🔥 传入 Ranker 参数
     )
 
     # Initialize evaluation environment
@@ -376,6 +680,7 @@ def train_td3_bc(config: TD3BCConfig):
     try:
         eval_env = OfflineEvalEnv(
             env_name=config.env_name,
+            dataset_quality=config.dataset_quality,
             device=config.device,
             seed=config.seed,
             verbose=False

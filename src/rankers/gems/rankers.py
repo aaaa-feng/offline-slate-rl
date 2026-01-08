@@ -217,8 +217,8 @@ class AbstractGeMS(Ranker):
             Pre-training of the ranker.
         '''
         ### 1 - Extract slates and clicks from batch
-        slates = torch.stack(batch.obs["slate"])            # batch_size, rec_size
-        clicks = torch.stack(batch.obs["clicks"]).float()            # batch_size, rec_size
+        slates = torch.stack(batch.obs["slate"]).to(self.device)            # batch_size, rec_size
+        clicks = torch.stack(batch.obs["clicks"]).float().to(self.device)            # batch_size, rec_size
 
         ### 2 - Pass through inference model
         latent_mu, log_latent_var = self.run_inference(slates, clicks)
@@ -254,8 +254,8 @@ class AbstractGeMS(Ranker):
             Validation step during pre-training of the ranker.
         '''
         ### 1 - Pass through embeddings
-        slates = torch.stack(batch.obs["slate"])            # batch_size, rec_size
-        clicks = torch.stack(batch.obs["clicks"]).float()            # batch_size, rec_size
+        slates = torch.stack(batch.obs["slate"]).to(self.device)            # batch_size, rec_size
+        clicks = torch.stack(batch.obs["clicks"]).float().to(self.device)            # batch_size, rec_size
 
         ### 2 - Pass through inference model
         latent_mu, log_latent_var = self.run_inference(slates, clicks)

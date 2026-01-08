@@ -6,7 +6,7 @@ import os
 import sys
 import logging
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -24,10 +24,12 @@ sys.path.insert(0, str(PROJECT_ROOT.parent))
 from config import paths
 from config.offline_config import BCConfig, auto_generate_paths, auto_generate_swanlab_config
 
-from common.offline.buffer import ReplayBuffer
+from common.offline.buffer import ReplayBuffer, TrajectoryReplayBuffer
 from common.offline.utils import set_seed, compute_mean_std
 from common.offline.networks import Actor
 from common.offline.eval_env import OfflineEvalEnv
+from belief_encoders.gru_belief import GRUBelief
+from rankers.gems.item_embeddings import ItemEmbeddings
 
 # SwanLab Logger
 try:
@@ -39,97 +41,253 @@ except ImportError:
 
 
 class BCAgent:
-    """Behavior Cloning Agent"""
+    """Behavior Cloning Agent with GeMS-aligned architecture"""
 
     def __init__(
         self,
-        state_dim: int,
         action_dim: int,
         config: BCConfig,
-        action_center: torch.Tensor = None,
-        action_scale: torch.Tensor = None,
+        ranker_params: Dict,  # 🔥 新增：接收 Ranker 参数
     ):
         self.config = config
         self.device = torch.device(config.device)
+        self.action_dim = action_dim
 
-        # 归一化参数 (保存在 agent 中,不参与梯度更新)
-        if action_center is not None:
-            self.action_center = action_center.to(self.device)
-            self.action_scale = action_scale.to(self.device)
-        else:
-            self.action_center = torch.zeros(action_dim, device=self.device)
-            self.action_scale = torch.ones(action_dim, device=self.device)
+        # ========================================================================
+        # 🔥 关键：从 Ranker 参数中提取组件（复刻在线逻辑）
+        # ========================================================================
 
-        # Actor network (max_action=1.0 因为 action 已归一化)
+        # 1. Action Bounds（直接使用 Ranker 的）
+        self.action_center = ranker_params['action_center'].to(self.device)
+        self.action_scale = ranker_params['action_scale'].to(self.device)
+        logging.info("=" * 80)
+        logging.info("=== Action Bounds from GeMS ===")
+        logging.info(f"  center shape: {self.action_center.shape}")
+        logging.info(f"  center mean: {self.action_center.mean().item():.6f}")
+        logging.info(f"  center std: {self.action_center.std().item():.6f}")
+        logging.info(f"  scale shape: {self.action_scale.shape}")
+        logging.info(f"  scale mean: {self.action_scale.mean().item():.6f}")
+        logging.info(f"  scale std: {self.action_scale.std().item():.6f}")
+        logging.info("=" * 80)
+
+        # 2. Item Embeddings（使用 GeMS 训练后的）
+        self.item_embeddings = ranker_params['item_embeddings']
+        logging.info(f"Item embeddings from GeMS: {self.item_embeddings.num_items} items, "
+                    f"{self.item_embeddings.embedd_dim} dims")
+
+        # 3. 初始化 GRU belief encoder
+        logging.info("Initializing GRU belief encoder...")
+        input_dim = config.rec_size * (config.item_embedd_dim + 1)
+
+        self.belief = GRUBelief(
+            item_embeddings=self.item_embeddings,  # 🔥 传入 GeMS 的 Embeddings
+            belief_state_dim=config.belief_hidden_dim,
+            item_embedd_dim=config.item_embedd_dim,
+            rec_size=config.rec_size,
+            ranker=None,
+            device=self.device,
+            belief_lr=0.0,
+            hidden_layers_reduction=[],
+            beliefs=["actor"],  # BC 只需要 actor
+            hidden_dim=config.belief_hidden_dim,
+            input_dim=input_dim  # 🔥 显式传入
+        )
+
+        # 4. 🔥 关键：双重保险 - 再次冻结 Embeddings
+        # 即使 GRUBelief 内部 deepcopy，我们也确保副本是冻结的
+        for module in self.belief.item_embeddings:
+            self.belief.item_embeddings[module].freeze()
+        logging.info("✅ Item embeddings frozen (double-checked)")
+
+        # 5. Actor network
         self.actor = Actor(
-            state_dim=state_dim,
+            state_dim=config.belief_hidden_dim,
             action_dim=action_dim,
-            max_action=1.0,
+            max_action=1.0,  # 输出 [-1, 1]，后续会用 action_scale 反归一化
             hidden_dim=config.hidden_dim
         ).to(self.device)
 
-        self.optimizer = torch.optim.Adam(
-            self.actor.parameters(),
-            lr=config.learning_rate
-        )
+        # 6. Optimizer（只包含 GRU 和 Actor，不包含 Embeddings）
+        self.optimizer = torch.optim.Adam([
+            {'params': self.belief.gru["actor"].parameters()},
+            {'params': self.actor.parameters()}
+        ], lr=config.learning_rate)
 
         self.total_it = 0
+        logging.info("✅ BCAgent initialized with GeMS-aligned architecture")
 
     def train(self, batch) -> Dict[str, float]:
-        """训练一步"""
-        self.total_it += 1
-        state, action, _, _, _ = batch
+        """
+        训练一步 (端到端训练 GRU + Actor)
 
-        # 前向传播
-        pred_action = self.actor(state)
+        Args:
+            batch: TrajectoryBatch with obs (Dict with 'slate' and 'clicks' as List[Tensor])
+                   and actions (List[Tensor])
+        """
+        self.total_it += 1
+
+        # GRU forward on trajectories
+        states, _ = self.belief.forward_batch(batch)
+        state = states["actor"]  # [sum_seq_lens, belief_hidden_dim]
+
+        # Concatenate actions
+        true_actions = torch.cat(batch.actions, dim=0)  # [sum_seq_lens, action_dim]
+
+        # Actor prediction
+        pred_actions = self.actor(state)  # [sum_seq_lens, action_dim]
 
         # BC Loss (MSE)
-        loss = F.mse_loss(pred_action, action)
+        loss = F.mse_loss(pred_actions, true_actions)
 
-        # 反向传播
+        # 反向传播 (同时更新 GRU 和 Actor)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
         return {
             "bc_loss": loss.item(),
-            "action_mean": pred_action.mean().item(),
-            "action_std": pred_action.std().item()
+            "action_mean": pred_actions.mean().item(),
+            "action_std": pred_actions.std().item()
         }
 
     @torch.no_grad()
-    def act(self, state: np.ndarray, deterministic: bool = True) -> np.ndarray:
-        """选择动作 (带反归一化)"""
-        state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
-        action = self.actor(state).cpu().numpy().flatten()
+    def act(self, obs: Dict[str, Any], deterministic: bool = True) -> np.ndarray:
+        """
+        选择动作 (使用 GRU 编码 + Actor 预测 + 反归一化)
+
+        Args:
+            obs: Dict with 'slate' and 'clicks' (torch.Tensor or numpy arrays)
+            deterministic: 是否确定性选择 (BC总是确定性的)
+
+        Returns:
+            action: 反归一化后的动作
+        """
+        # 统一转为 Tensor (无 Batch 维度)
+        slate = torch.as_tensor(obs["slate"], dtype=torch.long, device=self.device)
+        clicks = torch.as_tensor(obs["clicks"], dtype=torch.long, device=self.device)
+
+        # 构造输入 (不加 unsqueeze(0)!)
+        obs_tensor = {"slate": slate, "clicks": clicks}
+
+        # GRU编码
+        belief_state = self.belief.forward(obs_tensor, done=False)["actor"]
+
+        # Actor预测
+        raw_action = self.actor(belief_state)
 
         # 反归一化
-        action_center_np = self.action_center.cpu().numpy()
-        action_scale_np = self.action_scale.cpu().numpy()
-        action = action * action_scale_np + action_center_np
+        action = raw_action * self.action_scale + self.action_center
+        action = action.cpu().numpy().flatten()
 
         return action
 
+    def reset_hidden(self):
+        """
+        重置 GRU 隐藏状态 (在每个 episode 开始时调用)
+        使用 dummy obs + done=True 来优雅地重置
+        """
+        dummy_obs = {
+            "slate": torch.zeros((1, self.config.rec_size), dtype=torch.long, device=self.device),
+            "clicks": torch.zeros((1, self.config.rec_size), dtype=torch.long, device=self.device)
+        }
+        self.belief.forward(dummy_obs, done=True)
+
     def save(self, filepath: str):
-        """保存模型 (包含归一化参数)"""
+        """保存模型（包含所有必要信息，支持独立加载）"""
         torch.save({
-            'actor': self.actor.state_dict(),
+            # 模型权重
+            'belief_state_dict': self.belief.state_dict(),
+            'actor_state_dict': self.actor.state_dict(),
             'optimizer': self.optimizer.state_dict(),
+
+            # Action Bounds
             'action_center': self.action_center,
             'action_scale': self.action_scale,
+
+            # 🔥 新增：Embeddings 元数据（用于独立加载）
+            'embeddings_meta': {
+                'num_items': self.item_embeddings.num_items,
+                'embedd_dim': self.item_embeddings.embedd_dim,
+            },
+
+            # 其他信息
+            'action_dim': self.action_dim,
             'total_it': self.total_it,
+            'config': self.config,
         }, filepath)
-        logging.info(f"Model saved to {filepath}")
+        logging.info(f"✅ Model saved to {filepath} (with embeddings_meta)")
 
     def load(self, filepath: str):
-        """加载模型"""
+        """加载模型（需要先初始化 Agent）"""
         checkpoint = torch.load(filepath, map_location=self.device)
-        self.actor.load_state_dict(checkpoint['actor'])
+        self.belief.load_state_dict(checkpoint['belief_state_dict'])
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.action_center = checkpoint['action_center']
         self.action_scale = checkpoint['action_scale']
         self.total_it = checkpoint['total_it']
         logging.info(f"Model loaded from {filepath}")
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: str, device: str = "cuda"):
+        """
+        从 Checkpoint 独立加载 Agent，无需 GeMS（解决循环依赖）
+
+        Args:
+            checkpoint_path: Agent checkpoint 路径
+            device: 设备
+
+        Returns:
+            BCAgent 实例
+        """
+        logging.info("=" * 80)
+        logging.info("=== Loading BCAgent from Checkpoint (Standalone) ===")
+        logging.info(f"Checkpoint: {checkpoint_path}")
+        logging.info("=" * 80)
+
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        # 1. 从 Checkpoint 恢复 Embeddings
+        embeddings_meta = checkpoint['embeddings_meta']
+        belief_state = checkpoint['belief_state_dict']
+
+        # 提取 Embeddings 权重（从 belief state dict 中）
+        embedding_weights = belief_state['item_embeddings.actor.embedd.weight']
+
+        agent_embeddings = ItemEmbeddings(
+            num_items=embeddings_meta['num_items'],
+            item_embedd_dim=embeddings_meta['embedd_dim'],
+            device=device,
+            weights=embedding_weights
+        )
+        logging.info(f"✅ Embeddings restored: {embeddings_meta['num_items']} items, "
+                    f"{embeddings_meta['embedd_dim']} dims")
+
+        # 2. 构建 ranker_params
+        ranker_params = {
+            'item_embeddings': agent_embeddings,
+            'action_center': checkpoint['action_center'],
+            'action_scale': checkpoint['action_scale'],
+            'num_items': embeddings_meta['num_items'],
+            'item_embedd_dim': embeddings_meta['embedd_dim']
+        }
+
+        # 3. 创建 Agent
+        agent = cls(
+            action_dim=checkpoint['action_dim'],
+            config=checkpoint['config'],
+            ranker_params=ranker_params
+        )
+
+        # 4. 加载权重
+        agent.belief.load_state_dict(belief_state)
+        agent.actor.load_state_dict(checkpoint['actor_state_dict'])
+        agent.optimizer.load_state_dict(checkpoint['optimizer'])
+        agent.total_it = checkpoint['total_it']
+
+        logging.info(f"✅ BCAgent loaded from {checkpoint_path} (standalone mode)")
+        logging.info("=" * 80)
+        return agent
 
 
 def train_bc(config: BCConfig):
@@ -181,62 +339,208 @@ def train_bc(config: BCConfig):
     logging.info(f"Log file: {log_filepath}")
     logging.info("=" * 80)
 
-    # Load dataset
+    # ========================================================================
+    # 🔥 关键：加载 GeMS 并提取组件（复刻在线逻辑）
+    # ========================================================================
+    from rankers.gems.rankers import GeMS
+
+    # 1. 构建 GeMS Checkpoint 路径
+    gems_checkpoint_name = (
+        f"GeMS_{config.env_name}_{config.dataset_quality}_"
+        f"latent32_beta1.0_click0.5_seed58407201"
+    )
+    gems_path = (
+        f"/data/liyuefeng/offline-slate-rl/checkpoints/gems/offline/"
+        f"{gems_checkpoint_name}.ckpt"
+    )
+
+    logging.info("=" * 80)
+    logging.info("=== Loading Pretrained GeMS (Replicating Online Logic) ===")
+    logging.info("=" * 80)
+    logging.info(f"Checkpoint: {gems_path}")
+
+    # 2. 加载 GeMS Ranker
+    # 🔥 关键：先创建临时 ItemEmbeddings 用于加载 GeMS
+    temp_embeddings = ItemEmbeddings.from_pretrained(
+        config.item_embedds_path,
+        config.device
+    )
+
+    ranker = GeMS.load_from_checkpoint(
+        gems_path,
+        map_location=config.device,
+        item_embeddings=temp_embeddings,
+        device=config.device,
+        rec_size=config.rec_size,
+        item_embedd_dim=config.item_embedd_dim,
+        num_items=config.num_items,
+        latent_dim=32,  # 从 checkpoint 名称获取
+        lambda_click=0.5,  # 从 checkpoint 名称获取
+        lambda_KL=1.0,  # 从 checkpoint 名称获取
+        lambda_prior=1.0,
+        ranker_lr=3e-3,
+        fixed_embedds="scratch",
+        ranker_sample=False,
+        hidden_layers_infer=[512, 256],
+        hidden_layers_decoder=[256, 512]
+    )
+    ranker.eval()
+    ranker.freeze()
+    logging.info("✅ GeMS loaded and frozen")
+
+    # 显式强制设备同步 (对标 eval_env.py 和 iql.py)
+    ranker = ranker.to(config.device)
+    logging.info(f"✅ GeMS moved to {config.device}")
+
+    # 4. 🔥 关键：提取 GeMS 训练后的 Embeddings
+    gems_embedding_weights = ranker.item_embeddings.weight.data.clone()
+
+    agent_embeddings = ItemEmbeddings(
+        num_items=ranker.item_embeddings.num_embeddings,
+        item_embedd_dim=ranker.item_embeddings.embedding_dim,
+        device=config.device,
+        weights=gems_embedding_weights
+    )
+
+    # 5. 🔥 关键：提前冻结（在传入 GRUBelief 前）
+    for param in agent_embeddings.parameters():
+        param.requires_grad = False
+    logging.info("✅ Agent embeddings created and frozen")
+
+    # 6. 准备 Ranker 参数包
+    ranker_params = {
+        'item_embeddings': agent_embeddings,
+        'action_center': ranker.action_center,
+        'action_scale': ranker.action_scale,
+        'num_items': ranker.num_items,
+        'item_embedd_dim': ranker.item_embedd_dim
+    }
+    logging.info("=" * 80)
+
+    # ========================================================================
+    # 加载数据集
+    # ========================================================================
     logging.info(f"\nLoading dataset from: {config.dataset_path}")
     dataset = np.load(config.dataset_path)
 
     logging.info(f"Dataset statistics:")
-    logging.info(f"  Observations shape: {dataset['observations'].shape}")
+    logging.info(f"  Slates shape: {dataset['slates'].shape}")
+    logging.info(f"  Clicks shape: {dataset['clicks'].shape}")
     logging.info(f"  Actions shape: {dataset['actions'].shape}")
-    logging.info(f"  Total transitions: {len(dataset['observations'])}")
+    logging.info(f"  Total transitions: {len(dataset['slates'])}")
+
+    # ========================================================================
+    # 内存重打标 (In-Memory Action Relabeling) - Zero Trust Strategy
+    # ========================================================================
+    logging.info("")
+    logging.info("=" * 80)
+    logging.info("⚠️  IN-MEMORY ACTION RELABELING")
+    logging.info("=" * 80)
+    logging.info("Strategy: Zero Trust - Regenerate all actions using current GeMS")
+    logging.info("Reason:   Ensure absolute consistency between training and inference")
+
+    # 1. Extract raw discrete data
+    raw_slates = torch.tensor(dataset['slates'], device=config.device, dtype=torch.long)
+    raw_clicks = torch.tensor(dataset['clicks'], device=config.device, dtype=torch.float)
+    total_samples = len(raw_slates)
+
+    # 2. Batch inference to regenerate actions
+    batch_size = 1000
+    new_actions_list = []
+
+    with torch.no_grad():
+        for i in range(0, total_samples, batch_size):
+            batch_slates = raw_slates[i:i+batch_size]
+            batch_clicks = raw_clicks[i:i+batch_size]
+
+            # Key: Use current GeMS Encoder to infer latent actions
+            mu, _ = ranker.run_inference(batch_slates, batch_clicks)
+            new_actions_list.append(mu.cpu().numpy())
+
+            if (i + batch_size) % 100000 == 0 or (i + batch_size) >= total_samples:
+                processed = min(i + batch_size, total_samples)
+                logging.info(f"  Progress: {processed:,}/{total_samples:,}")
+
+    new_actions = np.concatenate(new_actions_list, axis=0)
+
+    # 3. Action statistics validation
+    logging.info("Action Statistics (Primary Quality Indicator):")
+    logging.info(f"  Mean:  {new_actions.mean():.6f} (expect ≈ 0)")
+    logging.info(f"  Std:   {new_actions.std():.6f}  (expect ≈ 1)")
+    logging.info(f"  Min:   {new_actions.min():.6f}")
+    logging.info(f"  Max:   {new_actions.max():.6f}")
+
+    # 4. GeMS reconstruction quality test (Informational only, no blocking)
+    logging.info("")
+    logging.info("GeMS Reconstruction Quality Test (Informational Only):")
+    test_size = min(100, len(raw_slates))
+    test_slates = raw_slates[:test_size]
+    test_clicks = raw_clicks[:test_size]
+    with torch.no_grad():
+        test_actions, _ = ranker.run_inference(test_slates, test_clicks)
+        # Loop decoding (ranker.rank does not support batch input)
+        matches_list = []
+        for i in range(test_size):
+            reconstructed = ranker.rank(test_actions[i])
+            match = (test_slates[i] == reconstructed).float().mean().item()
+            matches_list.append(match)
+        matches = np.mean(matches_list)
+    logging.info(f"  Exact match accuracy: {matches:.4f}")
+    logging.info("  Note: Low accuracy is normal for slate ranking tasks")
+
+    # 5. Overwrite old actions
+    logging.info("")
+    logging.info("✅ Action relabeling complete. Overwriting dataset actions.")
+    logging.info("=" * 80)
+    logging.info("")
 
     # Get dimensions
-    state_dim = dataset['observations'].shape[1]
     action_dim = dataset['actions'].shape[1]
 
     logging.info(f"\nEnvironment info:")
-    logging.info(f"  State dim: {state_dim}")
     logging.info(f"  Action dim: {action_dim}")
+    logging.info(f"  Rec size: {config.rec_size}")
+    logging.info(f"  Belief hidden dim: {config.belief_hidden_dim}")
 
-    # Create replay buffer
-    replay_buffer = ReplayBuffer(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        buffer_size=len(dataset['observations']),
-        device=config.device
-    )
+    # Create trajectory replay buffer
+    replay_buffer = TrajectoryReplayBuffer(device=config.device)
 
-    # Load data
+    # 6. Load data with relabeled actions
     dataset_dict = {
-        'observations': dataset['observations'],
-        'actions': dataset['actions'],
-        'rewards': dataset['rewards'],
-        'next_observations': dataset['next_observations'],
-        'terminals': dataset['terminals'],
+        'episode_ids': dataset['episode_ids'],
+        'slates': dataset['slates'],
+        'clicks': dataset['clicks'],
+        'actions': new_actions,  # Use relabeled actions!
     }
+
+    # 可选字段
+    if 'rewards' in dataset:
+        dataset_dict['rewards'] = dataset['rewards']
+    if 'terminals' in dataset:
+        dataset_dict['terminals'] = dataset['terminals']
+
     replay_buffer.load_d4rl_dataset(dataset_dict)
+    logging.info(f"✅ Buffer loaded successfully")
 
-    # === 关键: 数据归一化 ===
-    # 1. State normalization
-    state_mean, state_std = 0.0, 1.0
-    if config.normalize_states:
-        state_mean, state_std = compute_mean_std(dataset['observations'])
-        replay_buffer.normalize_states(state_mean, state_std)
-        logging.info(f"States normalized")
+    # 🔥 关键：从 Buffer 计算 Action Bounds（架构师方案）
+    # 使用数据集的实际统计值，而不是 GeMS checkpoint 中的值
+    logging.info("Calculating action bounds from buffer...")
+    action_center, action_scale = replay_buffer.get_action_normalization_params()
+    logging.info(f"✅ Action bounds calculated from buffer")
+    logging.info(f"  center shape: {action_center.shape}")
+    logging.info(f"  center mean: {action_center.mean().item():.6f}")
+    logging.info(f"  scale shape: {action_scale.shape}")
+    logging.info(f"  scale mean: {action_scale.mean().item():.6f}")
 
-    # 2. Action normalization (关键! 必须为True)
-    if not config.normalize_actions:
-        raise ValueError("normalize_actions must be True for offline RL!")
-    action_center, action_scale = replay_buffer.normalize_actions()
-    logging.info(f"Actions normalized to [-1, 1]")
+    # 更新 ranker_params 中的 action bounds
+    ranker_params['action_center'] = action_center
+    ranker_params['action_scale'] = action_scale
 
-    # Initialize BC agent
+    # Initialize BC agent (with GeMS-aligned architecture)
     agent = BCAgent(
-        state_dim=state_dim,
         action_dim=action_dim,
         config=config,
-        action_center=action_center,
-        action_scale=action_scale,
+        ranker_params=ranker_params,  # 🔥 传入 Ranker 参数
     )
 
     # Initialize SwanLab
@@ -268,6 +572,7 @@ def train_bc(config: BCConfig):
     try:
         eval_env = OfflineEvalEnv(
             env_name=config.env_name,
+            dataset_quality=config.dataset_quality,
             device=config.device,
             seed=config.seed,
             verbose=False

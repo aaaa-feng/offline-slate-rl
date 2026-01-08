@@ -1,20 +1,19 @@
 """
-Conservative Q-Learning (CQL) for GeMS datasets
+Conservative Q-Learning (CQL) for GeMS datasets with Dual-Stream E2E GRU
 Adapted from CORL: https://github.com/tinkoff-ai/CORL
 Original paper: https://arxiv.org/pdf/2006.04779.pdf
 
 Enhancements:
-- Unified with GeMS architecture
+- Dual-Stream End-to-End GRU Architecture
 - SwanLab logging support
-- OfflineEvalEnv integration
-- Simplified checkpoint/log structure
+- TrajectoryReplayBuffer for episode-based sampling
 """
 import copy
 import os
 import sys
 import logging
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Any
 from datetime import datetime
 
 import numpy as np
@@ -25,16 +24,17 @@ import torch.nn.functional as F
 # 添加项目路径
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-
-# 导入路径配置
 sys.path.insert(0, str(PROJECT_ROOT.parent))
+
 from config import paths
 from config.offline_config import CQLConfig, auto_generate_paths, auto_generate_swanlab_config
-
-from common.offline.buffer import ReplayBuffer
-from common.offline.utils import set_seed, compute_mean_std, soft_update
+from common.offline.buffer import TrajectoryReplayBuffer
+from common.offline.utils import set_seed, soft_update
 from common.offline.networks import TanhGaussianActor, Critic
 from common.offline.eval_env import OfflineEvalEnv
+from belief_encoders.gru_belief import GRUBelief
+from rankers.gems.item_embeddings import ItemEmbeddings
+from rankers.gems.rankers import GeMS
 
 # SwanLab Logger
 try:
@@ -46,99 +46,159 @@ except ImportError:
 
 
 class CQLAgent:
-    """Conservative Q-Learning Agent (Simplified)"""
+    """Conservative Q-Learning Agent with Dual-Stream E2E GRU (GeMS-aligned)"""
 
     def __init__(
         self,
-        state_dim: int,
         action_dim: int,
-        max_action: float,
         config: CQLConfig,
-        action_center: torch.Tensor = None,
-        action_scale: torch.Tensor = None,
+        ranker_params: Dict,  # 🔥 GeMS-aligned
     ):
         self.config = config
         self.device = torch.device(config.device)
+        self.action_dim = action_dim
+        self.max_action = 1.0
         self.total_it = 0
 
-        # Normalization parameters
-        if action_center is not None:
-            self.action_center = action_center.to(self.device)
-            self.action_scale = action_scale.to(self.device)
-        else:
-            self.action_center = torch.zeros(action_dim, device=self.device)
-            self.action_scale = torch.ones(action_dim, device=self.device)
+        # ========================================================================
+        # 🔥 从 Ranker 参数中提取组件
+        # ========================================================================
+
+        # 1. Action Bounds
+        self.action_center = ranker_params['action_center'].to(self.device)
+        self.action_scale = ranker_params['action_scale'].to(self.device)
+        logging.info("=" * 80)
+        logging.info("=== Action Bounds from GeMS ===")
+        logging.info(f"  center mean: {self.action_center.mean().item():.6f}")
+        logging.info(f"  scale mean: {self.action_scale.mean().item():.6f}")
+        logging.info("=" * 80)
+
+        # 2. Item Embeddings
+        self.item_embeddings = ranker_params['item_embeddings']
+        logging.info(f"Item embeddings from GeMS: {self.item_embeddings.num_items} items")
+
+        # 3. Initialize Dual-Stream GRU
+        logging.info("Initializing Dual-Stream GRU belief encoder...")
+        input_dim = config.rec_size * (config.item_embedd_dim + 1)
+
+        self.belief = GRUBelief(
+            item_embeddings=self.item_embeddings,
+            belief_state_dim=config.belief_hidden_dim,
+            item_embedd_dim=config.item_embedd_dim,
+            rec_size=config.rec_size,
+            ranker=None,
+            device=self.device,
+            belief_lr=0.0,
+            hidden_layers_reduction=[],
+            beliefs=["actor", "critic"],  # DUAL-STREAM
+            hidden_dim=config.belief_hidden_dim,
+            input_dim=input_dim
+        )
+
+        # 4. 双重冻结
+        for module in self.belief.item_embeddings:
+            self.belief.item_embeddings[module].freeze()
+        logging.info("✅ Item embeddings frozen (double-checked)")
 
         # Actor
         self.actor = TanhGaussianActor(
-            state_dim=state_dim,
+            state_dim=config.belief_hidden_dim,
             action_dim=action_dim,
-            max_action=max_action,
+            max_action=self.max_action,
             hidden_dim=config.hidden_dim,
             n_hidden=config.n_hidden,
         ).to(self.device)
 
         # Critics
-        self.critic_1 = Critic(state_dim, action_dim, config.hidden_dim).to(self.device)
-        self.critic_2 = Critic(state_dim, action_dim, config.hidden_dim).to(self.device)
-
-        # Target critics
+        self.critic_1 = Critic(config.belief_hidden_dim, action_dim, config.hidden_dim).to(self.device)
+        self.critic_2 = Critic(config.belief_hidden_dim, action_dim, config.hidden_dim).to(self.device)
         self.critic_1_target = copy.deepcopy(self.critic_1)
         self.critic_2_target = copy.deepcopy(self.critic_2)
 
-        # Optimizers
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config.actor_lr)
-        self.critic_1_optimizer = torch.optim.Adam(self.critic_1.parameters(), lr=config.critic_lr)
-        self.critic_2_optimizer = torch.optim.Adam(self.critic_2.parameters(), lr=config.critic_lr)
+        # Optimizers (分离)
+        self.actor_optimizer = torch.optim.Adam([
+            {'params': self.belief.gru["actor"].parameters()},
+            {'params': self.actor.parameters()}
+        ], lr=config.actor_lr)
+
+        self.critic_optimizer = torch.optim.Adam([
+            {'params': self.belief.gru["critic"].parameters()},
+            {'params': self.critic_1.parameters()},
+            {'params': self.critic_2.parameters()}
+        ], lr=config.critic_lr)
+
+        logging.info("CQLAgent initialized with Dual-Stream E2E GRU")
 
     def train(self, batch) -> Dict[str, float]:
-        """Train one step"""
+        """Train one step with CQL loss"""
         self.total_it += 1
-        state, action, reward, next_state, done = batch
 
-        # Critic loss (simplified CQL)
+        # Step 1: Dual-Stream GRU forward
+        states, next_states = self.belief.forward_batch(batch)
+        s_actor = states["actor"]
+        s_critic = states["critic"]
+        ns_critic = next_states["critic"]
+
+        # Step 2: Concatenate data
+        true_actions = torch.cat(batch.actions, dim=0)
+        rewards = torch.cat(batch.rewards, dim=0) if batch.rewards else None
+        dones = torch.cat(batch.dones, dim=0) if batch.dones else None
+
+        # Step 3: Critic Update (CQL Loss)
         with torch.no_grad():
-            next_action, next_log_prob = self.actor(next_state, need_log_prob=True)
-            target_q1 = self.critic_1_target.q1(next_state, next_action)
-            target_q2 = self.critic_2_target.q1(next_state, next_action)
+            # Sample next actions
+            next_actions, _ = self.actor(ns_critic, deterministic=False, need_log_prob=False)
+            target_q1 = self.critic_1_target.q1(ns_critic, next_actions)
+            target_q2 = self.critic_2_target.q1(ns_critic, next_actions)
             target_q = torch.min(target_q1, target_q2)
-            target_q = reward + (1 - done) * self.config.gamma * target_q
 
-        current_q1, current_q2 = self.critic_1(state, action)
+            if rewards is not None and dones is not None:
+                target_q = rewards + (1 - dones) * self.config.gamma * target_q
+            else:
+                target_q = target_q * self.config.gamma
+
+        # Current Q values (detach s_critic to avoid gradient conflict)
+        current_q1 = self.critic_1.q1(s_critic.detach(), true_actions)
+        current_q2 = self.critic_2.q1(s_critic.detach(), true_actions)
+
+        # Bellman error
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
-        # CQL penalty (simplified)
-        random_actions = torch.FloatTensor(state.shape[0], action.shape[-1]).uniform_(-1, 1).to(self.device)
-        q1_rand = self.critic_1.q1(state, random_actions)
-        q2_rand = self.critic_2.q1(state, random_actions)
-        
-        cql_loss = (q1_rand.mean() + q2_rand.mean() - current_q1.mean() - current_q2.mean()) * self.config.alpha
+        # CQL penalty: sample random actions
+        batch_size = s_critic.shape[0]
+        random_actions = torch.FloatTensor(batch_size, self.action_dim).uniform_(-1, 1).to(self.device)
 
-        total_critic_loss = critic_loss + cql_loss
+        # Q values for random actions (detach s_critic to avoid gradient conflict)
+        random_q1 = self.critic_1.q1(s_critic.detach(), random_actions)
+        random_q2 = self.critic_2.q1(s_critic.detach(), random_actions)
 
-        # Update critics
-        self.critic_1_optimizer.zero_grad()
-        self.critic_2_optimizer.zero_grad()
+        # CQL loss
+        cql_loss = (random_q1.mean() + random_q2.mean() - current_q1.mean() - current_q2.mean())
+        total_critic_loss = critic_loss + self.config.alpha * cql_loss
+
+        # Optimize critics
+        self.critic_optimizer.zero_grad()
         total_critic_loss.backward()
-        self.critic_1_optimizer.step()
-        self.critic_2_optimizer.step()
+        self.critic_optimizer.step()
+
+        # Step 4: Actor Update
+        # Sample actions from current policy
+        pi, log_pi = self.actor(s_actor, deterministic=False, need_log_prob=True)
+
+        # Q value (使用 detached s_critic)
+        q_pi = self.critic_1.q1(s_critic.detach(), pi)
 
         # Actor loss
-        actor_loss = torch.tensor(0.0)
-        if self.total_it % 2 == 0:
-            new_action, log_prob = self.actor(state, need_log_prob=True)
-            q1_new = self.critic_1.q1(state, new_action)
-            q2_new = self.critic_2.q1(state, new_action)
-            q_new = torch.min(q1_new, q2_new)
-            actor_loss = -q_new.mean()
+        actor_loss = -q_pi.mean()
 
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
+        # Optimize actor
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
 
-            # Soft update
-            soft_update(self.critic_1_target, self.critic_1, self.config.tau)
-            soft_update(self.critic_2_target, self.critic_2, self.config.tau)
+        # Update target networks
+        soft_update(self.critic_1_target, self.critic_1, self.config.tau)
+        soft_update(self.critic_2_target, self.critic_2, self.config.tau)
 
         return {
             "critic_loss": critic_loss.item(),
@@ -148,59 +208,133 @@ class CQLAgent:
         }
 
     @torch.no_grad()
-    def act(self, state: np.ndarray, deterministic: bool = True) -> np.ndarray:
-        """Select action"""
-        state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
-        action, _ = self.actor(state, deterministic=deterministic)
-        action = action.cpu().numpy().flatten()
+    def act(self, obs: Dict[str, Any], deterministic: bool = True) -> np.ndarray:
+        """Select action using Actor GRU"""
+        # 统一转为 Tensor (无 Batch 维度)
+        slate = torch.as_tensor(obs["slate"], dtype=torch.long, device=self.device)
+        clicks = torch.as_tensor(obs["clicks"], dtype=torch.long, device=self.device)
+
+        # 构造输入 (不加 unsqueeze(0)!)
+        obs_tensor = {"slate": slate, "clicks": clicks}
+
+        # Use Actor GRU only
+        belief_state = self.belief.forward(obs_tensor, done=False)["actor"]
+
+        # Actor prediction
+        raw_action, _ = self.actor(belief_state, deterministic=deterministic, need_log_prob=False)
 
         # Denormalize
-        action = action * self.action_scale.cpu().numpy() + self.action_center.cpu().numpy()
-        return action
+        action = raw_action * self.action_scale + self.action_center
+        return action.cpu().numpy().flatten()
+
+    def reset_hidden(self):
+        """Reset dual-stream GRU hidden states"""
+        dummy_obs = {
+            "slate": torch.zeros((1, self.config.rec_size), dtype=torch.long, device=self.device),
+            "clicks": torch.zeros((1, self.config.rec_size), dtype=torch.long, device=self.device)
+        }
+        self.belief.forward(dummy_obs, done=True)
 
     def save(self, filepath: str):
-        """Save model"""
+        """Save model with embeddings metadata for standalone loading"""
         torch.save({
-            'actor': self.actor.state_dict(),
-            'critic_1': self.critic_1.state_dict(),
-            'critic_2': self.critic_2.state_dict(),
+            'belief_state_dict': self.belief.state_dict(),
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_1_state_dict': self.critic_1.state_dict(),
+            'critic_2_state_dict': self.critic_2.state_dict(),
             'actor_optimizer': self.actor_optimizer.state_dict(),
-            'critic_1_optimizer': self.critic_1_optimizer.state_dict(),
-            'critic_2_optimizer': self.critic_2_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
             'action_center': self.action_center,
             'action_scale': self.action_scale,
             'total_it': self.total_it,
+            'embeddings_meta': {
+                'num_items': self.item_embeddings.num_items,
+                'embedd_dim': self.item_embeddings.embedd_dim,
+            },
+            'action_dim': self.action_dim,
+            'config': self.config,
         }, filepath)
         logging.info(f"Model saved to {filepath}")
 
     def load(self, filepath: str):
         """Load model"""
         checkpoint = torch.load(filepath, map_location=self.device)
-        self.actor.load_state_dict(checkpoint['actor'])
-        self.critic_1.load_state_dict(checkpoint['critic_1'])
-        self.critic_2.load_state_dict(checkpoint['critic_2'])
+        self.belief.load_state_dict(checkpoint['belief_state_dict'])
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic_1.load_state_dict(checkpoint['critic_1_state_dict'])
+        self.critic_2.load_state_dict(checkpoint['critic_2_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
-        self.critic_1_optimizer.load_state_dict(checkpoint['critic_1_optimizer'])
-        self.critic_2_optimizer.load_state_dict(checkpoint['critic_2_optimizer'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
         self.action_center = checkpoint['action_center']
         self.action_scale = checkpoint['action_scale']
         self.total_it = checkpoint['total_it']
         logging.info(f"Model loaded from {filepath}")
 
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: str, embedding_path: str, device: torch.device):
+        """
+        Load CQLAgent from checkpoint without requiring GeMS.
+
+        Args:
+            checkpoint_path: Path to saved agent checkpoint
+            embedding_path: Path to item embeddings (.pt file)
+            device: Device to load model on
+
+        Returns:
+            Loaded CQLAgent instance
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        # Extract metadata
+        config = checkpoint['config']
+        action_dim = checkpoint['action_dim']
+        embeddings_meta = checkpoint['embeddings_meta']
+
+        # Load embeddings
+        embedding_weights = torch.load(embedding_path, map_location=device)
+        item_embeddings = ItemEmbeddings(
+            num_items=embeddings_meta['num_items'],
+            item_embedd_dim=embeddings_meta['embedd_dim'],
+            device=device,
+            weights=embedding_weights
+        )
+
+        # Freeze embeddings
+        for param in item_embeddings.parameters():
+            param.requires_grad = False
+
+        # Construct ranker_params
+        ranker_params = {
+            'item_embeddings': item_embeddings,
+            'action_center': checkpoint['action_center'],
+            'action_scale': checkpoint['action_scale'],
+            'num_items': embeddings_meta['num_items'],
+            'item_embedd_dim': embeddings_meta['embedd_dim'],
+        }
+
+        # Create agent
+        agent = cls(action_dim=action_dim, config=config, ranker_params=ranker_params)
+
+        # Load state dicts
+        agent.belief.load_state_dict(checkpoint['belief_state_dict'])
+        agent.actor.load_state_dict(checkpoint['actor_state_dict'])
+        agent.critic_1.load_state_dict(checkpoint['critic_1_state_dict'])
+        agent.critic_2.load_state_dict(checkpoint['critic_2_state_dict'])
+        agent.total_it = checkpoint['total_it']
+
+        logging.info(f"CQLAgent loaded from {checkpoint_path}")
+        return agent
+
 
 def train_cql(config: CQLConfig):
-    """Train CQL"""
-    # Generate timestamp
+    """Train CQL with Dual-Stream E2E GRU"""
     timestamp = datetime.now().strftime("%Y%m%d")
-
-    # Auto-generate paths
     config = auto_generate_paths(config, timestamp)
     config = auto_generate_swanlab_config(config)
 
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-    # Configure logging
     log_filename = f"{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_seed{config.seed}_{timestamp}.log"
     log_filepath = os.path.join(config.log_dir, log_filename)
 
@@ -213,95 +347,207 @@ def train_cql(config: CQLConfig):
         handlers=[
             logging.FileHandler(log_filepath),
             logging.StreamHandler()
-        ]
+        ],
+        force=True
     )
 
-    # Set seed
     set_seed(config.seed)
     logging.info(f"Global seed set to {config.seed}")
 
-    # Print configuration
-    logging.info(f"{'='*80}")
-    logging.info(f"=== CQL Training Configuration ===")
-    logging.info(f"{'='*80}")
+    # Initialize SwanLab
+    swan_logger = None
+    if config.use_swanlab and SWANLAB_AVAILABLE:
+        try:
+            swan_logger = SwanlabLogger(
+                project=config.swan_project,
+                experiment_name=config.run_name,
+                workspace=config.swan_workspace,
+                config=config.__dict__,
+                mode=config.swan_mode,
+                logdir=config.swan_logdir,
+            )
+            logging.info(f"SwanLab initialized")
+        except Exception as e:
+            logging.warning(f"SwanLab init failed: {e}")
+
+    logging.info("=" * 80)
+    logging.info("=== CQL Training Configuration ===")
+    logging.info("=" * 80)
     logging.info(f"Environment: {config.env_name}")
     logging.info(f"Dataset: {config.dataset_path}")
-    logging.info(f"Seed: {config.seed}")
-    logging.info(f"Alpha (CQL weight): {config.alpha}")
-    logging.info(f"Discount (gamma): {config.gamma}")
-    logging.info(f"Normalize rewards: {config.normalize_rewards}")
-    logging.info(f"Max timesteps: {config.max_timesteps}")
-    logging.info(f"Batch size: {config.batch_size}")
-    logging.info(f"Actor LR: {config.actor_lr}")
-    logging.info(f"Critic LR: {config.critic_lr}")
+    logging.info(f"Alpha: {config.alpha}")
     logging.info(f"Log file: {log_filepath}")
-    logging.info(f"Checkpoint dir: {config.checkpoint_dir}")
-    logging.info(f"{'='*80}")
+    logging.info("=" * 80)
 
     # Load dataset
-    logging.info(f"\nLoading GeMS dataset from: {config.dataset_path}")
+    logging.info(f"\nLoading dataset from: {config.dataset_path}")
     dataset = np.load(config.dataset_path)
-    
-    logging.info(f"Dataset statistics:")
-    logging.info(f"  Observations shape: {dataset['observations'].shape}")
-    logging.info(f"  Actions shape: {dataset['actions'].shape}")
-    logging.info(f"  Total transitions: {len(dataset['observations'])}")
-    
-    # Get dimensions
-    state_dim = dataset['observations'].shape[1]
-    action_dim = dataset['actions'].shape[1]
-    max_action = 1.0  # Normalized
-    
-    logging.info(f"\nEnvironment info:")
-    logging.info(f"  State dim: {state_dim}")
-    logging.info(f"  Action dim: {action_dim}")
-    logging.info(f"  Max action: {max_action} (normalized)")
-    
-    # Create replay buffer
-    replay_buffer = ReplayBuffer(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        buffer_size=len(dataset['observations']),
-        device=config.device
-    )
-    
-    # Load data
-    dataset_dict = {
-        'observations': dataset['observations'],
-        'actions': dataset['actions'],
-        'next_observations': dataset['next_observations'],
-        'rewards': dataset['rewards'],
-        'terminals': dataset['terminals'],
-    }
-    replay_buffer.load_d4rl_dataset(dataset_dict)
 
-    # Normalize states
-    if config.normalize_states:
-        state_mean, state_std = compute_mean_std(dataset['observations'])
-        replay_buffer.normalize_states(state_mean, state_std)
-        logging.info(f"States normalized")
-    
-    # Normalize rewards
-    if config.normalize_rewards:
-        reward_mean = dataset['rewards'].mean()
-        reward_std = dataset['rewards'].std()
-        replay_buffer.normalize_rewards(reward_mean, reward_std)
-        logging.info(f"Rewards normalized (mean={reward_mean:.4f}, std={reward_std:.4f})")
-    
-    # Normalize actions (必须)
-    if not config.normalize_actions:
-        raise ValueError("normalize_actions must be True for offline RL!")
-    action_center, action_scale = replay_buffer.normalize_actions()
-    logging.info(f"Actions normalized to [-1, 1]")
-    
-    # Initialize CQL
+    logging.info(f"Dataset statistics:")
+    logging.info(f"  Slates shape: {dataset['slates'].shape}")
+    logging.info(f"  Clicks shape: {dataset['clicks'].shape}")
+    logging.info(f"  Actions shape: {dataset['actions'].shape}")
+    logging.info(f"  Total transitions: {len(dataset['slates'])}")
+
+    # ========================================================================
+    # Load GeMS (必须在重打标之前)
+    # ========================================================================
+    logging.info(f"\n{'='*80}")
+    logging.info("Loading GeMS checkpoint")
+    logging.info(f"{'='*80}")
+
+    gems_checkpoint_name = f"GeMS_{config.env_name}_{config.dataset_quality}_latent32_beta1.0_click0.5_seed58407201"
+    gems_path = f"/data/liyuefeng/offline-slate-rl/checkpoints/gems/offline/{gems_checkpoint_name}.ckpt"
+    logging.info(f"GeMS checkpoint: {gems_path}")
+
+    # Load temporary embeddings for GeMS initialization
+    temp_embeddings = ItemEmbeddings.from_pretrained(config.item_embedds_path, config.device)
+
+    # Load GeMS checkpoint
+    from rankers.gems.rankers import GeMS
+    ranker = GeMS.load_from_checkpoint(
+        gems_path,
+        map_location=config.device,
+        item_embeddings=temp_embeddings,
+        item_embedd_dim=config.item_embedd_dim,
+        device=config.device,
+        rec_size=config.rec_size,
+        latent_dim=32,
+        lambda_click=0.5,
+        lambda_KL=1.0,
+        lambda_prior=1.0,
+        ranker_lr=3e-3,
+        fixed_embedds="scratch",
+        ranker_sample=False,
+        hidden_layers_infer=[512, 256],
+        hidden_layers_decoder=[256, 512]
+    )
+    ranker.freeze()
+    logging.info("✅ GeMS checkpoint loaded")
+
+    # 显式强制设备同步
+    ranker = ranker.to(config.device)
+    logging.info(f"✅ GeMS moved to {config.device}")
+
+    # ========================================================================
+    # 内存重打标 (In-Memory Action Relabeling) - Zero Trust Strategy
+    # ========================================================================
+    logging.info("")
+    logging.info("=" * 80)
+    logging.info("⚠️  IN-MEMORY ACTION RELABELING")
+    logging.info("=" * 80)
+    logging.info("Strategy: Zero Trust - Regenerate all actions using current GeMS")
+    logging.info("Reason:   Ensure absolute consistency between training and inference")
+
+    # 1. Extract raw discrete data
+    raw_slates = torch.tensor(dataset['slates'], device=config.device, dtype=torch.long)
+    raw_clicks = torch.tensor(dataset['clicks'], device=config.device, dtype=torch.float)
+    total_samples = len(raw_slates)
+
+    # 2. Batch inference to regenerate actions
+    batch_size = 1000
+    new_actions_list = []
+
+    with torch.no_grad():
+        for i in range(0, total_samples, batch_size):
+            batch_slates = raw_slates[i:i+batch_size]
+            batch_clicks = raw_clicks[i:i+batch_size]
+
+            # Key: Use current GeMS Encoder to infer latent actions
+            mu, _ = ranker.run_inference(batch_slates, batch_clicks)
+            new_actions_list.append(mu.cpu().numpy())
+
+            if (i + batch_size) % 100000 == 0 or (i + batch_size) >= total_samples:
+                processed = min(i + batch_size, total_samples)
+                logging.info(f"  Progress: {processed:,}/{total_samples:,}")
+
+    new_actions = np.concatenate(new_actions_list, axis=0)
+
+    # 3. Action statistics validation
+    logging.info("Action Statistics (Primary Quality Indicator):")
+    logging.info(f"  Mean:  {new_actions.mean():.6f} (expect ≈ 0)")
+    logging.info(f"  Std:   {new_actions.std():.6f}  (expect ≈ 1)")
+    logging.info(f"  Min:   {new_actions.min():.6f}")
+    logging.info(f"  Max:   {new_actions.max():.6f}")
+
+    # 4. GeMS reconstruction quality test (Informational only, no blocking)
+    logging.info("")
+    logging.info("GeMS Reconstruction Quality Test (Informational Only):")
+    test_size = min(100, len(raw_slates))
+    test_slates = raw_slates[:test_size]
+    test_clicks = raw_clicks[:test_size]
+    with torch.no_grad():
+        test_actions, _ = ranker.run_inference(test_slates, test_clicks)
+        # Loop decoding (ranker.rank does not support batch input)
+        matches_list = []
+        for i in range(test_size):
+            reconstructed = ranker.rank(test_actions[i])
+            match = (test_slates[i] == reconstructed).float().mean().item()
+            matches_list.append(match)
+        matches = np.mean(matches_list)
+    logging.info(f"  Exact match accuracy: {matches:.4f}")
+    logging.info("  Note: Low accuracy is normal for slate ranking tasks")
+
+    # 5. Overwrite old actions
+    logging.info("")
+    logging.info("✅ Action relabeling complete. Overwriting dataset actions.")
+    logging.info("=" * 80)
+    logging.info("")
+
+    # Get dimensions
+    action_dim = dataset['actions'].shape[1]
+
+    # Create buffer
+    replay_buffer = TrajectoryReplayBuffer(device=config.device)
+    # 6. Load data with relabeled actions
+    dataset_dict = {
+        'episode_ids': dataset['episode_ids'],
+        'slates': dataset['slates'],
+        'clicks': dataset['clicks'],
+        'actions': new_actions,  # Use relabeled actions!
+    }
+    if 'rewards' in dataset:
+        dataset_dict['rewards'] = dataset['rewards']
+    if 'terminals' in dataset:
+        dataset_dict['terminals'] = dataset['terminals']
+
+    replay_buffer.load_d4rl_dataset(dataset_dict)
+    action_center, action_scale = replay_buffer.get_action_normalization_params()
+
+    # Extract GeMS-trained embeddings (GeMS already loaded before relabeling)
+    logging.info(f"\n{'='*80}")
+    logging.info("Extracting embeddings from GeMS")
+    logging.info(f"{'='*80}")
+    gems_embedding_weights = ranker.item_embeddings.weight.data.clone()
+    logging.info(f"✅ Extracted embeddings: shape={gems_embedding_weights.shape}")
+
+    # Create agent's ItemEmbeddings with GeMS weights
+    agent_embeddings = ItemEmbeddings(
+        num_items=ranker.num_items,
+        item_embedd_dim=config.item_embedd_dim,
+        device=config.device,
+        weights=gems_embedding_weights
+    )
+
+    # Freeze embeddings
+    for param in agent_embeddings.parameters():
+        param.requires_grad = False
+    logging.info("✅ Agent embeddings frozen")
+
+    # Construct ranker_params
+    ranker_params = {
+        'item_embeddings': agent_embeddings,
+        'action_center': action_center,
+        'action_scale': action_scale,
+        'num_items': ranker.num_items,
+        'item_embedd_dim': config.item_embedd_dim,
+    }
+
+    # Initialize agent
     agent = CQLAgent(
-        state_dim=state_dim,
         action_dim=action_dim,
-        max_action=max_action,
         config=config,
-        action_center=action_center,
-        action_scale=action_scale,
+        ranker_params=ranker_params,
     )
 
     # Initialize evaluation environment
@@ -312,6 +558,7 @@ def train_cql(config: CQLConfig):
     try:
         eval_env = OfflineEvalEnv(
             env_name=config.env_name,
+            dataset_quality=config.dataset_quality,
             device=config.device,
             seed=config.seed,
             verbose=False
@@ -329,18 +576,21 @@ def train_cql(config: CQLConfig):
     for t in range(int(config.max_timesteps)):
         # Sample batch
         batch = replay_buffer.sample(config.batch_size)
-        
+
         # Train
         metrics = agent.train(batch)
-        
+
         # Logging
-        if (t + 1) % config.log_freq == 0:
+        if (t + 1) % 1000 == 0:
             log_msg = (f"Step {t+1}/{config.max_timesteps}: "
-                      f"critic_loss={metrics['critic_loss']:.4f}, "
-                      f"cql_loss={metrics['cql_loss']:.4f}, "
-                      f"actor_loss={metrics['actor_loss']:.4f}, "
+                      f"critic_loss={metrics['critic_loss']:.6f}, "
+                      f"cql_loss={metrics['cql_loss']:.6f}, "
+                      f"actor_loss={metrics['actor_loss']:.6f}, "
                       f"q_value={metrics['q_value']:.4f}")
             logging.info(log_msg)
+
+            if swan_logger:
+                swan_logger.log_metrics(metrics, step=t+1)
 
         # Evaluation
         if eval_env is not None and (t + 1) % config.eval_freq == 0:
@@ -358,15 +608,22 @@ def train_cql(config: CQLConfig):
                       f"{eval_metrics['std_reward']:.2f}")
             logging.info(log_msg)
 
+            if swan_logger:
+                swan_logger.log_metrics({
+                    'eval/mean_reward': eval_metrics['mean_reward'],
+                    'eval/std_reward': eval_metrics['std_reward'],
+                    'eval/mean_episode_length': eval_metrics['mean_episode_length'],
+                }, step=t+1)
+
         # Save checkpoint
         if (t + 1) % config.save_freq == 0:
             checkpoint_path = os.path.join(
                 config.checkpoint_dir,
-                f"step_{t+1}.pt"
+                f"cql_{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_step{t+1}.pt"
             )
             agent.save(checkpoint_path)
 
-    # Save final model
+    # Final save
     final_path = os.path.join(
         config.checkpoint_dir,
         f"cql_{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_final.pt"
@@ -389,11 +646,19 @@ def train_cql(config: CQLConfig):
         logging.info(f"  Mean Reward: {final_eval_metrics['mean_reward']:.2f} ± {final_eval_metrics['std_reward']:.2f}")
         logging.info(f"  Mean Episode Length: {final_eval_metrics['mean_episode_length']:.2f}")
 
-    logging.info(f"\n{'='*80}")
-    logging.info(f"Training completed!")
-    logging.info(f"{'='*80}\n")
+        if swan_logger:
+            swan_logger.log_metrics({
+                'final_eval/mean_reward': final_eval_metrics['mean_reward'],
+                'final_eval/std_reward': final_eval_metrics['std_reward'],
+                'final_eval/mean_episode_length': final_eval_metrics['mean_episode_length'],
+            }, step=config.max_timesteps)
 
-    return agent
+    logging.info(f"\n{'='*80}")
+    logging.info(f"CQL training completed!")
+    logging.info(f"{'='*80}")
+
+    if swan_logger:
+        swan_logger.experiment.finish()
 
 
 if __name__ == "__main__":
@@ -401,7 +666,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train CQL (Conservative Q-Learning) on offline datasets")
 
-    # 实验配置
+    # Experiment configuration
     parser.add_argument("--experiment_name", type=str, default="baseline_experiment",
                         help="实验名称")
     parser.add_argument("--env_name", type=str, default="diffuse_mix",
@@ -414,11 +679,11 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda",
                         help="设备")
 
-    # 数据集配置
+    # Dataset configuration
     parser.add_argument("--dataset_path", type=str, default="",
                         help="数据集路径 (如果为空则自动生成)")
 
-    # 训练配置
+    # Training configuration
     parser.add_argument("--max_timesteps", type=int, default=int(1e6),
                         help="最大训练步数")
     parser.add_argument("--batch_size", type=int, default=256,
@@ -429,24 +694,26 @@ if __name__ == "__main__":
                         help="保存频率 (训练步数)")
     parser.add_argument("--log_freq", type=int, default=1000,
                         help="日志记录频率")
+
+    # CQL-specific hyperparameters
+    parser.add_argument("--alpha", type=float, default=5.0,
+                        help="CQL alpha (conservative penalty weight)")
+    parser.add_argument("--actor_lr", type=float, default=3e-4,
+                        help="Actor learning rate")
+    parser.add_argument("--critic_lr", type=float, default=3e-4,
+                        help="Critic learning rate")
+    parser.add_argument("--gamma", type=float, default=0.99,
+                        help="Discount factor")
+    parser.add_argument("--tau", type=float, default=0.005,
+                        help="Target network update rate")
+
+    # Network configuration
     parser.add_argument("--hidden_dim", type=int, default=256,
                         help="隐藏层维度")
     parser.add_argument("--n_hidden", type=int, default=2,
                         help="隐藏层数量")
 
-    # CQL特定参数
-    parser.add_argument("--alpha", type=float, default=1.0,
-                        help="CQL正则化系数")
-    parser.add_argument("--gamma", type=float, default=0.99,
-                        help="折扣因子")
-    parser.add_argument("--tau", type=float, default=0.005,
-                        help="软更新系数")
-    parser.add_argument("--actor_lr", type=float, default=3e-4,
-                        help="Actor学习率")
-    parser.add_argument("--critic_lr", type=float, default=3e-4,
-                        help="Critic学习率")
-
-    # SwanLab配置
+    # SwanLab configuration
     parser.add_argument("--use_swanlab", action="store_true", default=True,
                         help="是否使用SwanLab")
     parser.add_argument("--no_swanlab", action="store_false", dest="use_swanlab",
@@ -466,13 +733,13 @@ if __name__ == "__main__":
         eval_freq=args.eval_freq,
         save_freq=args.save_freq,
         log_freq=args.log_freq,
-        hidden_dim=args.hidden_dim,
-        n_hidden=args.n_hidden,
         alpha=args.alpha,
-        gamma=args.gamma,
-        tau=args.tau,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
+        gamma=args.gamma,
+        tau=args.tau,
+        hidden_dim=args.hidden_dim,
+        n_hidden=args.n_hidden,
         use_swanlab=args.use_swanlab,
     )
 

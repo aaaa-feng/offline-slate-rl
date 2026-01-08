@@ -46,6 +46,16 @@ class BaseOfflineConfig:
     learning_rate: float = 3e-4  # 学习率
 
     # ============================================================================
+    # GRU & Embedding 配置 (用于端到端训练)
+    # ============================================================================
+    num_items: int = 1000  # 物品总数
+    rec_size: int = 10  # 推荐列表大小
+    item_embedd_dim: int = 20  # 物品嵌入维度
+    belief_hidden_dim: int = 20  # GRU隐藏状态维度
+    latent_dim: int = 32  # GeMS 潜在空间维度
+    item_embedds_path: str = ""  # 物品嵌入路径 (如果为空则自动生成)
+
+    # ============================================================================
     # 路径配置 (自动生成)
     # ============================================================================
     log_dir: str = ""  # 日志目录
@@ -204,6 +214,21 @@ def auto_generate_paths(config: BaseOfflineConfig, timestamp: str) -> BaseOfflin
         config.dataset_path = str(
             paths.get_offline_dataset_path(config.env_name, dataset_filename)
         )
+
+    # 4. 生成物品嵌入路径 (根据环境名称自动推断)
+    if not config.item_embedds_path:
+        # 根据 env_name 推断 embedding 文件名
+        # diffuse_* → item_embeddings_diffuse.pt
+        # focused_* → item_embeddings_focused.pt
+        if "diffuse" in config.env_name:
+            embeddings_filename = "item_embeddings_diffuse.pt"
+        elif "focused" in config.env_name:
+            embeddings_filename = "item_embeddings_focused.pt"
+        else:
+            # 默认使用 diffuse
+            embeddings_filename = "item_embeddings_diffuse.pt"
+
+        config.item_embedds_path = str(paths.get_embeddings_path(embeddings_filename))
 
     return config
 

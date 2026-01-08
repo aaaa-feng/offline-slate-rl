@@ -5,6 +5,7 @@ Replay Buffer for offline RL
 import torch
 import numpy as np
 from typing import Dict, Tuple, List
+from dataclasses import dataclass
 
 class ReplayBuffer:
     """Replay buffer for offline RL training"""
@@ -155,3 +156,214 @@ class ReplayBuffer:
         print(f"  Action scale shape: {action_scale.shape}")
 
         return action_center, action_scale
+
+
+@dataclass
+class TrajectoryBatch:
+    """
+    Trajectory batch for RNN-based agents
+
+    Attributes:
+        obs: Dict with keys 'slate' and 'clicks', each containing List[Tensor]
+             - slate: List of [seq_len, rec_size] tensors
+             - clicks: List of [seq_len, rec_size] tensors
+        actions: List of [seq_len, action_dim] tensors
+        rewards: List of [seq_len, 1] tensors (optional, for value-based methods)
+        dones: List of [seq_len, 1] tensors (optional, for value-based methods)
+    """
+    obs: Dict[str, List[torch.Tensor]]
+    actions: List[torch.Tensor]
+    rewards: List[torch.Tensor] = None
+    dones: List[torch.Tensor] = None
+
+
+class TrajectoryReplayBuffer:
+    """
+    Trajectory-based replay buffer for RNN agents
+    Stores complete episodes and samples trajectories for end-to-end training
+    """
+
+    def __init__(self, device: str = "cuda"):
+        """
+        Initialize trajectory replay buffer
+
+        Args:
+            device: Device to store tensors on
+        """
+        self._device = device
+        self._trajectories = []  # List[Dict] with keys: 'slate', 'clicks', 'action', 'reward', 'done'
+        self._num_episodes = 0
+        self._num_transitions = 0
+        self._action_center = None
+        self._action_scale = None
+
+    def normalize_actions(self, data: Dict[str, np.ndarray], eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        对动作进行 Min-Max 归一化到 [-1, 1] 范围
+        使用正确的公式: action_center = (action_max + action_min) / 2
+
+        Args:
+            data: 包含 'actions' 的字典
+            eps: 防止除零的小常数
+
+        Returns:
+            action_center: 归一化中心点 (用于反归一化)
+            action_scale: 缩放比例 (用于反归一化)
+        """
+        all_actions = torch.tensor(data["actions"], dtype=torch.float32, device=self._device)
+
+        # 计算每个维度的 min 和 max
+        action_min = all_actions.min(dim=0)[0]
+        action_max = all_actions.max(dim=0)[0]
+
+        # 使用正确的公式计算 center 和 scale
+        action_center = (action_max + action_min) / 2
+        action_scale = (action_max - action_min) / 2 + eps
+
+        # 归一化所有动作
+        normalized_actions = (all_actions - action_center) / action_scale
+
+        print(f"Actions normalized to [-1, 1]")
+        print(f"  Original range: [{action_min.min().item():.4f}, {action_max.max().item():.4f}]")
+        print(f"  Normalized range: [{normalized_actions.min().item():.4f}, {normalized_actions.max().item():.4f}]")
+        print(f"  Action center shape: {action_center.shape}")
+        print(f"  Action scale shape: {action_scale.shape}")
+
+        return action_center, action_scale, normalized_actions
+
+    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
+        """
+        加载D4RL格式的数据集，按episode_ids分割成trajectories
+
+        Args:
+            data: 包含以下字段的字典:
+                - episode_ids: (N,) episode标识
+                - slates: (N, rec_size) 推荐slate
+                - clicks: (N, rec_size) 用户点击
+                - actions: (N, action_dim) 动作（潜在向量）
+                - rewards: (N,) 奖励（可选）
+                - terminals: (N,) 终止标志（可选）
+        """
+        if self._trajectories:
+            raise ValueError("Trying to load data into non-empty replay buffer")
+
+        # 1. 归一化动作
+        print("Normalizing actions...")
+        action_center, action_scale, normalized_actions = self.normalize_actions(data)
+        self._action_center = action_center
+        self._action_scale = action_scale
+
+        # 2. 转换为tensor
+        episode_ids = data["episode_ids"]
+        slates = torch.tensor(data["slates"], dtype=torch.long, device=self._device)
+        clicks = torch.tensor(data["clicks"], dtype=torch.long, device=self._device)
+        actions = normalized_actions  # 已经是tensor
+
+        # 可选字段
+        if "rewards" in data:
+            rewards = torch.tensor(data["rewards"], dtype=torch.float32, device=self._device)
+        else:
+            rewards = None
+
+        if "terminals" in data:
+            dones = torch.tensor(data["terminals"], dtype=torch.float32, device=self._device)
+        else:
+            dones = None
+
+        # 3. 按episode_ids分割成trajectories
+        print("Splitting into trajectories...")
+        unique_episode_ids = np.unique(episode_ids)
+        self._num_episodes = len(unique_episode_ids)
+
+        for ep_id in unique_episode_ids:
+            # 找到属于当前episode的所有transition
+            mask = episode_ids == ep_id
+            indices = np.where(mask)[0]
+
+            # 提取当前episode的数据
+            ep_slates = slates[indices]
+            ep_clicks = clicks[indices]
+            ep_actions = actions[indices]
+
+            trajectory = {
+                "slate": ep_slates,
+                "clicks": ep_clicks,
+                "action": ep_actions,
+            }
+
+            if rewards is not None:
+                trajectory["reward"] = rewards[indices]
+            if dones is not None:
+                trajectory["done"] = dones[indices]
+
+            self._trajectories.append(trajectory)
+            self._num_transitions += len(indices)
+
+        print(f"Dataset loaded: {self._num_episodes} episodes, {self._num_transitions} transitions")
+        print(f"Average episode length: {self._num_transitions / self._num_episodes:.1f}")
+
+    def sample(self, batch_size: int) -> TrajectoryBatch:
+        """
+        采样一个batch的trajectories
+
+        Args:
+            batch_size: 要采样的episode数量
+
+        Returns:
+            TrajectoryBatch对象，包含:
+                - obs: Dict with 'slate' and 'clicks' as List[Tensor]
+                - actions: List[Tensor]
+                - rewards: List[Tensor] (if available)
+                - dones: List[Tensor] (if available)
+        """
+        # 随机采样episode indices
+        indices = np.random.randint(0, self._num_episodes, size=batch_size)
+
+        # 收集数据
+        slates_list = []
+        clicks_list = []
+        actions_list = []
+        rewards_list = []
+        dones_list = []
+
+        for idx in indices:
+            traj = self._trajectories[idx]
+            slates_list.append(traj["slate"])
+            clicks_list.append(traj["clicks"])
+            actions_list.append(traj["action"])
+
+            if "reward" in traj:
+                rewards_list.append(traj["reward"].unsqueeze(-1))  # [seq_len, 1]
+            if "done" in traj:
+                dones_list.append(traj["done"].unsqueeze(-1))  # [seq_len, 1]
+
+        # 构造batch
+        obs = {
+            "slate": slates_list,
+            "clicks": clicks_list,
+        }
+
+        batch = TrajectoryBatch(
+            obs=obs,
+            actions=actions_list,
+            rewards=rewards_list if rewards_list else None,
+            dones=dones_list if dones_list else None,
+        )
+
+        return batch
+
+    def get_action_normalization_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        获取动作归一化参数（用于Agent初始化）
+
+        Returns:
+            action_center: 归一化中心点
+            action_scale: 缩放比例
+        """
+        if self._action_center is None or self._action_scale is None:
+            raise ValueError("Action normalization parameters not available. Call load_d4rl_dataset first.")
+        return self._action_center, self._action_scale
+
+    def __len__(self) -> int:
+        """返回episode数量"""
+        return self._num_episodes

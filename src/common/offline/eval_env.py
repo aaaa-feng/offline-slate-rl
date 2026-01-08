@@ -5,8 +5,9 @@
 包括:
 - 环境创建
 - Ranker (GeMS VAE) 加载
-- Belief Encoder (GRU) 加载
-- 完整推理流程: Agent → Ranker → Slate → Environment
+- 完整推理流程: Agent (内置GRU) → Ranker → Slate → Environment
+
+注: 端到端模式,Agent自带GRU Belief Encoder
 """
 
 import sys
@@ -28,8 +29,6 @@ from config.env_params import get_env_config
 # 导入在线RL组件
 from common.online.data_module import BufferDataModule
 from common.online.env_wrapper import EnvWrapper
-from envs.RecSim.simulators import TopicRec
-from belief_encoders.gru_belief import BeliefEncoder, GRUBelief
 from rankers.gems.rankers import GeMS
 from rankers.gems.item_embeddings import ItemEmbeddings
 
@@ -45,6 +44,7 @@ class OfflineEvalEnv:
     def __init__(
         self,
         env_name: str,
+        dataset_quality: str = "medium",
         device: str = "cuda",
         seed: int = 58407201,
         verbose: bool = True
@@ -54,11 +54,13 @@ class OfflineEvalEnv:
 
         Args:
             env_name: 环境名称 (如 diffuse_mix)
+            dataset_quality: 数据集质量 (random/medium/expert)
             device: 设备
             seed: 随机种子
             verbose: 是否打印详细信息
         """
         self.env_name = env_name
+        self.dataset_quality = dataset_quality
         self.device = device
         self.seed = seed
         self.verbose = verbose
@@ -75,8 +77,8 @@ class OfflineEvalEnv:
         # 初始化组件
         self.env = None
         self.ranker = None
-        self.belief_encoder = None
         self.item_embeddings = None
+        self.ranker_checkpoint_path = None  # 用于日志输出
 
         # 创建环境
         self._create_environment()
@@ -87,11 +89,21 @@ class OfflineEvalEnv:
         # 加载Ranker
         self._load_ranker()
 
-        # 加载Belief Encoder
-        self._load_belief_encoder()
-
-        if self.verbose:
-            logging.info("OfflineEvalEnv initialization completed")
+        # 强制打印参数摘要 (无视 verbose 设置,确保可观测性)
+        logging.info("")
+        logging.info("=" * 70)
+        logging.info("Offline Evaluation Environment Setup")
+        logging.info("=" * 70)
+        logging.info(f"Env Name:            {self.env_name}")
+        logging.info(f"Dataset Quality:     {self.dataset_quality}")
+        logging.info(f"Click Model:         {self.env_config['click_model']}")
+        logging.info(f"Diversity Penalty:   {self.env_config['diversity_penalty']}")
+        logging.info(f"Episode Length:      {self.env_config['episode_length']}")
+        logging.info(f"Boredom Threshold:   {self.env_config['boredom_threshold']}")
+        logging.info(f"Ranker Source:       {self.ranker_checkpoint_path}")
+        logging.info("=" * 70)
+        logging.info("✅ OfflineEvalEnv initialization completed (GeMS-only E2E mode)")
+        logging.info("")
 
     def _create_environment(self):
         """创建环境 (使用与数据收集一致的参数)"""
@@ -175,105 +187,56 @@ class OfflineEvalEnv:
             logging.warning(f"  Embeddings file not found: {embeddings_path}")
 
     def _load_ranker(self):
-        """加载Ranker (GeMS VAE)"""
+        """加载Ranker (GeMS VAE) - 直接从纯GeMS checkpoint加载"""
         if self.verbose:
             logging.info("Loading Ranker (GeMS)...")
 
-        # 构建checkpoint路径 (PROJECT_ROOT已经是src目录,需要回到项目根目录)
+        # 构建GeMS checkpoint路径
         project_root = PROJECT_ROOT.parent
-        data_collection_models_dir = project_root / "src" / "data_collection" / "offline_data_collection" / "models"
-        sac_gems_ckpt_path = data_collection_models_dir / self.env_config["sac_gems_checkpoint"]
+        gems_ckpt_dir = project_root / "checkpoints" / "gems" / "offline"
 
-        if not sac_gems_ckpt_path.exists():
-            raise FileNotFoundError(f"SAC+GeMS checkpoint not found: {sac_gems_ckpt_path}")
+        # 根据环境名称和数据集质量构建checkpoint文件名
+        # 格式: GeMS_{env_name}_{quality}_latent32_beta1.0_click0.5_seed58407201.ckpt
+        dataset_name = self.env_config["dataset_name"]
+        gems_ckpt_name = f"GeMS_{dataset_name}_{self.dataset_quality}_latent32_beta1.0_click0.5_seed58407201.ckpt"
+        gems_ckpt_path = gems_ckpt_dir / gems_ckpt_name
 
-        # 加载checkpoint
-        checkpoint = torch.load(sac_gems_ckpt_path, map_location=self.device)
-        state_dict = checkpoint['state_dict']
+        if not gems_ckpt_path.exists():
+            raise FileNotFoundError(f"GeMS checkpoint not found: {gems_ckpt_path}")
 
-        # 创建GeMS Ranker (使用与checkpoint匹配的hidden layers配置)
-        self.ranker = GeMS(
+        # 保存路径用于日志输出
+        self.ranker_checkpoint_path = str(gems_ckpt_path)
+
+        if self.verbose:
+            logging.info(f"  Loading Ranker from: {gems_ckpt_path}")
+
+        # 使用GeMS.load_from_checkpoint标准方法加载
+        self.ranker = GeMS.load_from_checkpoint(
+            str(gems_ckpt_path),
+            map_location=self.device,
             item_embeddings=self.item_embeddings,
-            latent_dim=self.env_config["latent_dim"],
-            belief_state_dim=self.env_config["belief_state_dim"],
             item_embedd_dim=self.env_config["item_embedd_dim"],
-            rec_size=10,  # slate大小
-            hidden_layers_infer=[512, 256],  # 从checkpoint推断出的配置
-            hidden_layers_decoder=[256, 512],  # 从checkpoint推断出的配置
+            device=self.device,
+            rec_size=10,
+            latent_dim=self.env_config["latent_dim"],
             lambda_click=0.5,
             lambda_KL=1.0,
-            lambda_prior=0.0,
-            ranker_lr=0.001,
-            fixed_embedds=False,
+            lambda_prior=1.0,
+            ranker_lr=3e-3,
+            fixed_embedds="scratch",
             ranker_sample=False,
-            device=self.device
+            hidden_layers_infer=[512, 256],
+            hidden_layers_decoder=[256, 512]
         )
 
-        # 提取ranker相关的权重
-        ranker_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('ranker.'):
-                new_key = key.replace('ranker.', '')
-                ranker_state_dict[new_key] = value
-
-        # 加载权重
-        self.ranker.load_state_dict(ranker_state_dict)
         self.ranker.eval()
+        self.ranker.freeze()
 
-        # 确保所有参数都在正确的设备上
+        # 显式强制设备同步 (不依赖 load_from_checkpoint 的自动管理)
         self.ranker = self.ranker.to(self.device)
 
         if self.verbose:
-            logging.info(f"  Ranker loaded from: {sac_gems_ckpt_path}")
-
-    def _load_belief_encoder(self):
-        """加载Belief Encoder (GRU)"""
-        if self.verbose:
-            logging.info("Loading Belief Encoder (GRU)...")
-
-        # 构建checkpoint路径 (PROJECT_ROOT已经是src目录,需要回到项目根目录)
-        project_root = PROJECT_ROOT.parent
-        data_collection_models_dir = project_root / "src" / "data_collection" / "offline_data_collection" / "models"
-        sac_gems_ckpt_path = data_collection_models_dir / self.env_config["sac_gems_checkpoint"]
-
-        # 加载checkpoint
-        checkpoint = torch.load(sac_gems_ckpt_path, map_location=self.device)
-        state_dict = checkpoint['state_dict']
-
-        # 创建Belief Encoder
-        self.belief_encoder = GRUBelief(
-            belief_state_dim=self.env_config["belief_state_dim"],
-            hidden_dim=self.env_config["belief_state_dim"],
-            input_dim=10 * (self.env_config["item_embedd_dim"] + 1),  # rec_size * (item_embedd_dim + 1)
-            item_embeddings=self.item_embeddings,
-            item_embedd_dim=self.env_config["item_embedd_dim"],
-            rec_size=10,
-            ranker=self.ranker,
-            belief_lr=0.001,
-            hidden_layers_reduction=[],
-            beliefs=["actor"],  # 只需要actor的GRU
-            device=self.device
-        )
-
-        # 提取Belief Encoder的权重 (只加载actor相关的权重,过滤掉critic)
-        belief_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('belief.'):
-                # 只移除 'belief.' 前缀,保留完整的嵌套结构
-                new_key = key.replace('belief.', '', 1)
-                # 过滤掉critic相关的权重 (我们只需要actor)
-                if 'critic' not in new_key:
-                    belief_state_dict[new_key] = value
-
-        # 加载权重
-        self.belief_encoder.load_state_dict(belief_state_dict)
-        self.belief_encoder.eval()
-
-        # 确保所有参数都在正确的设备上
-        self.belief_encoder = self.belief_encoder.to(self.device)
-
-        if self.verbose:
-            logging.info(f"  Belief Encoder loaded from: {sac_gems_ckpt_path}")
+            logging.info(f"  ✅ GeMS Ranker loaded successfully")
 
     def evaluate_policy(
         self,
@@ -282,10 +245,10 @@ class OfflineEvalEnv:
         deterministic: bool = True
     ) -> Dict[str, float]:
         """
-        评估策略性能
+        评估策略性能 (端到端模式)
 
         Args:
-            agent: 离线RL agent (BC/TD3+BC/CQL/IQL)
+            agent: 离线RL agent (BC/TD3+BC/CQL/IQL) - 必须是端到端架构
             num_episodes: 评估轮数
             deterministic: 是否使用确定性策略
 
@@ -293,7 +256,8 @@ class OfflineEvalEnv:
             评估指标字典
         """
         if self.verbose:
-            logging.info(f"Evaluating policy for {num_episodes} episodes...")
+            logging.info(f"Evaluating policy for {num_episodes} episodes (E2E mode)...")
+            logging.info(f"Using Ranker: {self.ranker_checkpoint_path}")
 
         episode_rewards = []
         episode_lengths = []
@@ -305,28 +269,26 @@ class OfflineEvalEnv:
             episode_reward = 0.0
             episode_length = 0
 
-            # 重置GRU hidden state
-            if hasattr(self.belief_encoder, 'reset_hidden'):
-                self.belief_encoder.reset_hidden()
+            # 重置Agent的GRU hidden state
+            if hasattr(agent, 'reset_hidden'):
+                agent.reset_hidden()
 
             while not done:
-                # 1. 将原始obs转换为belief_state (使用GRU)
-                with torch.no_grad():
-                    belief_state = self.belief_encoder.forward(obs, done=False)
+                # 端到端模式: Agent直接处理原始obs并输出latent_action
+                latent_action = agent.act(obs, deterministic=deterministic)
 
-                # 2. Agent输出latent_action (32维)
-                # belief_state是tensor,需要转为numpy给agent
-                belief_state_np = belief_state.cpu().numpy()
-                latent_action = agent.act(belief_state_np, deterministic=deterministic)
-
-                # 3. 将latent_action转为tensor给Ranker (添加batch维度)
+                # 将latent_action转为tensor给Ranker (添加batch维度)
                 latent_action_tensor = torch.FloatTensor(latent_action).unsqueeze(0).to(self.device)
 
-                # 4. Ranker解码为slate
+                # 防御性检查: 确保 tensor 确实在正确的设备上
+                if latent_action_tensor.device != self.ranker.device:
+                    latent_action_tensor = latent_action_tensor.to(self.ranker.device)
+
+                # Ranker解码为slate
                 with torch.no_grad():
                     slate = self.ranker.rank(latent_action_tensor).squeeze(0)
 
-                # 5. 环境执行
+                # 环境执行
                 obs, reward, done, info = self.env.step(slate)
 
                 # 转换reward为Python标量

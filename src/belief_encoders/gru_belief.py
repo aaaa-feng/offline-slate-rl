@@ -109,6 +109,10 @@ class GRUBelief(BeliefEncoder):
 
         self.reduction = None
 
+        # Auto-calculate input_dim if not provided
+        if self.input_dim is None:
+            self.input_dim = self.rec_size * (self.item_embedd_dim + 1)
+
         self.gru = ModuleDict({})
         self.hidden = {}
         for module in self.beliefs:
@@ -129,18 +133,34 @@ class GRUBelief(BeliefEncoder):
         with torch.inference_mode():
             if not done:
                 # Then we can compute the new belief
+                states = {}
                 if "actor" in self.beliefs:
                     item_embeddings = self.item_embeddings["actor"](obs["slate"])    # (rec_size, item_embedd_dim)
                     obs_embedd = torch.cat([item_embeddings, obs["clicks"].float().unsqueeze(1)], dim = 1).flatten() # (rec_size * (item_embedd_dim + 1))
-                    out, self.hidden["actor"] = self.gru["actor"](obs_embedd.unsqueeze(0).unsqueeze(1), self.hidden["actor"]) 
-                elif "critic" in self.beliefs:
+                    # 确保 hidden state 与输入在同一设备
+                    if self.hidden["actor"].device != obs_embedd.device:
+                        self.hidden["actor"] = self.hidden["actor"].to(obs_embedd.device)
+                    out, self.hidden["actor"] = self.gru["actor"](obs_embedd.unsqueeze(0).unsqueeze(1), self.hidden["actor"])
+                    states["actor"] = out.squeeze()
+                if "critic" in self.beliefs:
                     item_embeddings = self.item_embeddings["critic"](obs["slate"])    # (rec_size, item_embedd_dim)
                     obs_embedd = torch.cat([item_embeddings, obs["clicks"].float().unsqueeze(1)], dim = 1).flatten() # (rec_size * (item_embedd_dim + 1))
-                    out, self.hidden["critic"] = self.gru["critic"](obs_embedd.unsqueeze(0).unsqueeze(1), self.hidden["critic"]) 
-                return out.squeeze() # belief_state_dim
+                    # 确保 hidden state 与输入在同一设备
+                    if self.hidden["critic"].device != obs_embedd.device:
+                        self.hidden["critic"] = self.hidden["critic"].to(obs_embedd.device)
+                    out, self.hidden["critic"] = self.gru["critic"](obs_embedd.unsqueeze(0).unsqueeze(1), self.hidden["critic"])
+                    states["critic"] = out.squeeze()
+                if "belief" in self.beliefs:
+                    item_embeddings = self.item_embeddings["belief"](obs["slate"])
+                    obs_embedd = torch.cat([item_embeddings, obs["clicks"].float().unsqueeze(1)], dim = 1).flatten()
+                    if self.hidden["belief"].device != obs_embedd.device:
+                        self.hidden["belief"] = self.hidden["belief"].to(obs_embedd.device)
+                    out, self.hidden["belief"] = self.gru["belief"](obs_embedd.unsqueeze(0).unsqueeze(1), self.hidden["belief"])
+                    states["belief"] = out.squeeze()
+                return states
             else:
                 for module in self.beliefs:
-                    self.hidden[module] = torch.zeros(1, 1, self.hidden_dim, device = self.device)
+                    self.hidden[module] = torch.zeros(1, 1, self.hidden_dim, device = self.my_device)
     
     def forward_batch(self, batch) -> torch.FloatTensor:
         '''
@@ -161,11 +181,11 @@ class GRUBelief(BeliefEncoder):
             obs_embedd[module] = torch.nn.utils.rnn.pack_padded_sequence(obs_embedd[module], lens, batch_first = True, enforce_sorted = False)
             
             ### Project into latent space
-            hidden = torch.zeros(1, batch_size, self.hidden_dim, device = self.device)
+            hidden = torch.zeros(1, batch_size, self.hidden_dim, device = self.my_device)
 
             states[module], _ = self.gru[module](obs_embedd[module], hidden) 
             states[module], _ = torch.nn.utils.rnn.pad_packed_sequence(states[module], batch_first = True)   # (batch_size, max_seq_len, belief_state_dim)
             states[module] = torch.cat([states[module][i, :lens[i], :] for i in range(batch_size)], dim = 0) # (sum_seq_lens, belief_state_dim)
-            next_states[module] = torch.cat([states[module][1:].detach(), torch.zeros(1, self.hidden_dim, device = self.device)], dim = 0) # (sum_seq_lens, belief_state_dim)
+            next_states[module] = torch.cat([states[module][1:].detach(), torch.zeros(1, self.hidden_dim, device = self.my_device)], dim = 0) # (sum_seq_lens, belief_state_dim)
 
         return states, next_states
