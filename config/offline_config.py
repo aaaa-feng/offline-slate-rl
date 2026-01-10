@@ -65,13 +65,14 @@ class BaseOfflineConfig:
     # SwanLab配置
     # ============================================================================
     use_swanlab: bool = True  # 是否使用SwanLab
-    swan_project: str = "GeMS_Offline_RL_202512"  # SwanLab项目名
+    swan_project: str = "Offline_Slate_RL_202601"  # SwanLab项目名
     swan_workspace: str = "Cliff"  # SwanLab工作空间
     swan_mode: str = "cloud"  # SwanLab模式: cloud, local, offline
     swan_logdir: str = "experiments/swanlog"  # SwanLab本地日志目录
     swan_tags: List[str] = field(default_factory=list)  # SwanLab标签
     swan_description: str = ""  # SwanLab描述
     run_name: str = ""  # 运行名称 (如果为空则自动生成)
+    run_id: str = ""  # 唯一运行标识符 (格式: MMDD_HHMM, 如果为空则自动生成)
 
 
 @dataclass
@@ -188,18 +189,22 @@ def auto_generate_paths(config: BaseOfflineConfig, timestamp: str) -> BaseOfflin
 
     Args:
         config: 配置对象
-        timestamp: 时间戳 (格式: YYYYMMDD)
+        timestamp: 时间戳 (格式: YYYYMMDD, 仅用于日志文件名兼容性)
 
     Returns:
         更新后的配置对象
     """
+    from datetime import datetime
     from config import paths
+
+    # 0. 确保 run_id 存在
+    if not config.run_id:
+        config.run_id = datetime.now().strftime("%m%d_%H%M")
 
     # 1. 生成日志目录
     if not config.log_dir:
         config.log_dir = str(
-            paths.LOGS_DIR / "offline" / f"log_{config.seed}" / config.algo_name /
-            config.experiment_name
+            paths.LOGS_DIR / "offline" / f"log_{config.seed}" / config.algo_name
         )
 
     # 2. 生成checkpoint目录
@@ -243,13 +248,19 @@ def auto_generate_swanlab_config(config: BaseOfflineConfig) -> BaseOfflineConfig
     Returns:
         更新后的配置对象
     """
-    # 1. 生成 run_name
+    from datetime import datetime
+
+    # 0. 生成或使用 run_id
+    if not config.run_id:
+        config.run_id = datetime.now().strftime("%m%d_%H%M")
+
+    # 1. 生成 run_name (添加 run_id 后缀)
     if not config.run_name:
         key_params = _get_key_params_str(config)
         if key_params:
-            config.run_name = f"{config.algo_name}_{config.env_name}_{config.dataset_quality}_{key_params}_seed{config.seed}"
+            config.run_name = f"{config.algo_name}_{config.env_name}_{config.dataset_quality}_{key_params}_seed{config.seed}_{config.run_id}"
         else:
-            config.run_name = f"{config.algo_name}_{config.env_name}_{config.dataset_quality}_seed{config.seed}"
+            config.run_name = f"{config.algo_name}_{config.env_name}_{config.dataset_quality}_seed{config.seed}_{config.run_id}"
 
     # 2. 生成 SwanLab tags
     if not config.swan_tags:

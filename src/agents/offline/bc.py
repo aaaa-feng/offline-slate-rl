@@ -142,12 +142,23 @@ class BCAgent:
         # 反向传播 (同时更新 GRU 和 Actor)
         self.optimizer.zero_grad()
         loss.backward()
+
+        # 计算梯度范数（用于监控）
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), float('inf'))
+        gru_grad_norm = torch.nn.utils.clip_grad_norm_(self.belief.gru["actor"].parameters(), float('inf'))
+
         self.optimizer.step()
 
         return {
             "bc_loss": loss.item(),
             "action_mean": pred_actions.mean().item(),
-            "action_std": pred_actions.std().item()
+            "action_std": pred_actions.std().item(),
+            "action_min": pred_actions.min().item(),
+            "action_max": pred_actions.max().item(),
+            "target_action_mean": true_actions.mean().item(),
+            "target_action_std": true_actions.std().item(),
+            "actor_grad_norm": actor_grad_norm.item(),
+            "gru_grad_norm": gru_grad_norm.item(),
         }
 
     @torch.no_grad()
@@ -305,7 +316,7 @@ def train_bc(config: BCConfig):
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     # 配置 logging
-    log_filename = f"{config.env_name}_{config.dataset_quality}_seed{config.seed}_{timestamp}.log"
+    log_filename = f"{config.env_name}_{config.dataset_quality}_seed{config.seed}_{config.run_id}.log"
     log_filepath = os.path.join(config.log_dir, log_filename)
 
     # 清除已有的handlers并重新配置
@@ -596,14 +607,30 @@ def train_bc(config: BCConfig):
 
         # Logging
         if (t + 1) % 1000 == 0:
-            log_msg = (f"Step {t+1}/{config.max_timesteps}: "
-                      f"bc_loss={metrics['bc_loss']:.6f}, "
-                      f"action_mean={metrics['action_mean']:.4f}, "
-                      f"action_std={metrics['action_std']:.4f}")
-            logging.info(log_msg)
+            # 构建统一的 SwanLab 指标字典（带命名空间前缀）
+            swanlab_metrics = {
+                # BC 的 bc_loss 映射到统一的 actor_loss
+                "train/actor_loss": metrics['bc_loss'],
+                "train/actor_grad_norm": metrics['actor_grad_norm'],
+                "train/action_mean": metrics['action_mean'],
+                "train/action_std": metrics['action_std'],
+                "train/action_min": metrics['action_min'],
+                "train/action_max": metrics['action_max'],
+                # BC 特有指标
+                "train/target_action_mean": metrics['target_action_mean'],
+                "train/target_action_std": metrics['target_action_std'],
+                "train/gru_grad_norm": metrics['gru_grad_norm'],
+            }
+
+            # 全量本地日志记录（与 SwanLab 完全一致）
+            log_parts = [f"Step {t+1}/{config.max_timesteps}:"]
+            for key, value in swanlab_metrics.items():
+                short_key = key.replace("train/", "")
+                log_parts.append(f"{short_key}={value:.6f}")
+            logging.info(", ".join(log_parts))
 
             if swan_logger:
-                swan_logger.log_metrics(metrics, step=t+1)
+                swan_logger.log_metrics(swanlab_metrics, step=t+1)
 
         # Evaluation
         if eval_env is not None and (t + 1) % config.eval_freq == 0:
@@ -632,14 +659,14 @@ def train_bc(config: BCConfig):
         if (t + 1) % config.save_freq == 0:
             checkpoint_path = os.path.join(
                 config.checkpoint_dir,
-                f"bc_{config.env_name}_{config.dataset_quality}_step{t+1}.pt"
+                f"bc_{config.env_name}_{config.dataset_quality}_lr{config.learning_rate}_seed{config.seed}_{config.run_id}_step{t+1}.pt"
             )
             agent.save(checkpoint_path)
 
     # Final save
     final_path = os.path.join(
         config.checkpoint_dir,
-        f"bc_{config.env_name}_{config.dataset_quality}_final.pt"
+        f"bc_{config.env_name}_{config.dataset_quality}_lr{config.learning_rate}_seed{config.seed}_{config.run_id}_final.pt"
     )
     agent.save(final_path)
 
@@ -689,6 +716,8 @@ if __name__ == "__main__":
                         help="数据集质量")
     parser.add_argument("--seed", type=int, default=58407201,
                         help="随机种子")
+    parser.add_argument("--run_id", type=str, default="",
+                        help="唯一运行标识符 (格式: MMDD_HHMM, 如果为空则自动生成)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="设备")
 
@@ -725,6 +754,7 @@ if __name__ == "__main__":
         env_name=args.env_name,
         dataset_quality=args.dataset_quality,
         seed=args.seed,
+        run_id=args.run_id,
         device=args.device,
         dataset_path=args.dataset_path,
         max_timesteps=args.max_timesteps,

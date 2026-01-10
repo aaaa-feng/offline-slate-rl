@@ -207,6 +207,10 @@ class TD3_BC:
                 # 如果没有 reward/done，使用简化版本
                 target_q = target_q * self.config.gamma
 
+            # 🔧 HOT-FIX: Target Q Clamping (防止Q值爆炸)
+            # 由于reward已经缩放到 [-1, 1] 范围,Q值应该在 [-10, 10] 范围内
+            target_q = torch.clamp(target_q, -10.0, 10.0)
+
         # 使用 Critic GRU 的 current_state 计算 current Q
         # Detach s_critic to avoid gradient conflict (Critic optimizer doesn't include GRU)
         current_q1 = self.critic_1.q1(s_critic.detach(), true_actions)
@@ -218,6 +222,11 @@ class TD3_BC:
         # Optimize Critic + Critic GRU
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        # 🔧 HOT-FIX: Critic Gradient Clipping (防止梯度爆炸)
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            list(self.critic_1.parameters()) + list(self.critic_2.parameters()),
+            10.0  # 从 float('inf') 改为 10.0
+        )
         self.critic_optimizer.step()
 
         # Step 4: Actor Update (TD3+BC Loss) - Delayed
@@ -241,6 +250,8 @@ class TD3_BC:
             # Optimize Actor + Actor GRU
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
+            # 🔧 HOT-FIX: Actor Gradient Clipping (防止梯度爆炸)
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100.0)  # 从 float('inf') 改为 100.0
             self.actor_optimizer.step()
 
             # Update target networks
@@ -259,6 +270,12 @@ class TD3_BC:
             "q_max": max(current_q1.max().item(), current_q2.max().item()),
             "q_min": min(current_q1.min().item(), current_q2.min().item()),
             "q_std": current_q1.std().item(),
+            "target_q": target_q.mean().item(),
+            # 🔧 HOT-FIX: 新增诊断指标
+            "target_q_max": target_q.max().item(),
+            "target_q_min": target_q.min().item(),
+            "critic_grad_norm": critic_grad_norm.item(),
+            "actor_grad_norm": actor_grad_norm.item() if actor_loss is not None else 0.0,
         }
 
     @torch.no_grad()
@@ -412,7 +429,7 @@ def train_td3_bc(config: TD3BCConfig):
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     # 生成日志文件名
-    log_filename = f"{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_seed{config.seed}_{timestamp}.log"
+    log_filename = f"{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_seed{config.seed}_{config.run_id}.log"
     log_filepath = os.path.join(config.log_dir, log_filename)
 
     # 清除已有的handlers并重新配置
@@ -649,7 +666,12 @@ def train_td3_bc(config: TD3BCConfig):
 
     # 可选字段
     if 'rewards' in dataset:
-        dataset_dict['rewards'] = dataset['rewards']
+        if config.normalize_rewards:
+            # Apply scaling / 100.0 as standard practice
+            dataset_dict['rewards'] = dataset['rewards'] / 100.0
+            logging.info("⚡ Applied reward scaling: rewards / 100.0")
+        else:
+            dataset_dict['rewards'] = dataset['rewards']
     if 'terminals' in dataset:
         dataset_dict['terminals'] = dataset['terminals']
 
@@ -704,31 +726,37 @@ def train_td3_bc(config: TD3BCConfig):
 
         # Logging
         if (t + 1) % 1000 == 0:
-            log_msg = (f"Step {t+1}/{config.max_timesteps}: "
-                      f"critic_loss={train_metrics['critic_loss']:.4f}, "
-                      f"actor_loss={train_metrics['actor_loss']:.4f}, "
-                      f"bc_loss={train_metrics['bc_loss']:.4f}, "
-                      f"q_value={train_metrics['q_value']:.4f}")
-            logging.info(log_msg)
+            # 构建统一的 SwanLab 指标字典（带命名空间前缀）
+            swanlab_metrics = {
+                # 公共指标
+                "train/actor_loss": train_metrics['actor_loss'],
+                "train/actor_grad_norm": train_metrics['actor_grad_norm'],
+                # Critic/Q 指标
+                "train/critic_loss": train_metrics['critic_loss'],
+                "train/critic_grad_norm": train_metrics['critic_grad_norm'],
+                "train/q_value_mean": train_metrics['q_value'],
+                "train/q1_value": train_metrics['q1_value'],
+                "train/q2_value": train_metrics['q2_value'],
+                "train/q_value_std": train_metrics['q_std'],
+                "train/q_max": train_metrics['q_max'],
+                "train/q_min": train_metrics['q_min'],
+                "train/target_q_mean": train_metrics['target_q'],
+                # 🔧 HOT-FIX: 新增诊断指标
+                "train/target_q_max": train_metrics['target_q_max'],
+                "train/target_q_min": train_metrics['target_q_min'],
+                # TD3+BC 特有指标
+                "train/bc_loss": train_metrics['bc_loss'],
+            }
 
-            # SwanLab logging (完整指标)
+            # 全量本地日志记录（与 SwanLab 完全一致）
+            log_parts = [f"Step {t+1}/{config.max_timesteps}:"]
+            for key, value in swanlab_metrics.items():
+                short_key = key.replace("train/", "")
+                log_parts.append(f"{short_key}={value:.6f}")
+            logging.info(", ".join(log_parts))
+
             if config.use_swanlab and swan_logger:
-                swan_logger.log_metrics({
-                    # 训练Loss
-                    "train/critic_loss": train_metrics['critic_loss'],
-                    "train/actor_loss": train_metrics['actor_loss'],
-                    "train/bc_loss": train_metrics['bc_loss'],
-                    "train/q_value": train_metrics['q_value'],
-                    "train/q1_value": train_metrics['q1_value'],
-                    "train/q2_value": train_metrics['q2_value'],
-                    # Q值监控
-                    "train/q_max": train_metrics['q_max'],
-                    "train/q_min": train_metrics['q_min'],
-                    "train/q_std": train_metrics['q_std'],
-                    # 训练状态
-                    "train/step": t + 1,
-                    "train/learning_rate": config.learning_rate,
-                }, step=t+1)
+                swan_logger.log_metrics(swanlab_metrics, step=t+1)
 
         # Evaluation
         if eval_env is not None and (t + 1) % config.eval_freq == 0:
@@ -757,14 +785,14 @@ def train_td3_bc(config: TD3BCConfig):
         if (t + 1) % config.save_freq == 0:
             checkpoint_path = os.path.join(
                 config.checkpoint_dir,
-                f"step_{t+1}.pt"
+                f"td3bc_{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_lr{config.actor_lr}_seed{config.seed}_{config.run_id}_step{t+1}.pt"
             )
             agent.save(checkpoint_path)
 
     # Save final model
     final_path = os.path.join(
         config.checkpoint_dir,
-        f"td3_bc_{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_final.pt"
+        f"td3bc_{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_lr{config.actor_lr}_seed{config.seed}_{config.run_id}_final.pt"
     )
     agent.save(final_path)
 
@@ -816,6 +844,8 @@ if __name__ == "__main__":
                         help="数据集质量")
     parser.add_argument("--seed", type=int, default=58407201,
                         help="随机种子")
+    parser.add_argument("--run_id", type=str, default="",
+                        help="唯一运行标识符 (格式: MMDD_HHMM, 如果为空则自动生成)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="设备")
 
@@ -866,6 +896,7 @@ if __name__ == "__main__":
         env_name=args.env_name,
         dataset_quality=args.dataset_quality,
         seed=args.seed,
+        run_id=args.run_id,
         device=args.device,
         dataset_path=args.dataset_path,
         max_timesteps=args.max_timesteps,

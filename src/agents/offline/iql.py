@@ -194,6 +194,7 @@ class IQLAgent:
         # Optimize value network (retain graph for later use of s_critic)
         self.value_optimizer.zero_grad()
         value_loss.backward(retain_graph=True)
+        value_grad_norm = torch.nn.utils.clip_grad_norm_(self.value.parameters(), float('inf'))
         self.value_optimizer.step()
 
         # ========================================================================
@@ -219,6 +220,10 @@ class IQLAgent:
         # Optimize critics
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            list(self.critic_1.parameters()) + list(self.critic_2.parameters()),
+            float('inf')
+        )
         self.critic_optimizer.step()
 
         # ========================================================================
@@ -245,6 +250,7 @@ class IQLAgent:
         # Optimize actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), float('inf'))
         self.actor_optimizer.step()
 
         # Update target networks (use iql_tau for soft update, not expectile tau)
@@ -257,7 +263,13 @@ class IQLAgent:
             "actor_loss": actor_loss.item(),
             "v_value": current_v.mean().item(),
             "q_value": current_q1.mean().item(),
+            "q_value_std": current_q1.std().item(),
+            "target_q": target_q.mean().item(),
             "advantage": advantage.mean().item(),
+            "advantage_std": advantage.std().item(),
+            "value_grad_norm": value_grad_norm.item(),
+            "critic_grad_norm": critic_grad_norm.item(),
+            "actor_grad_norm": actor_grad_norm.item(),
         }
 
     @torch.no_grad()
@@ -393,7 +405,7 @@ def train_iql(config: IQLConfig):
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-    log_filename = f"{config.env_name}_{config.dataset_quality}_expectile{config.tau}_seed{config.seed}_{timestamp}.log"
+    log_filename = f"{config.env_name}_{config.dataset_quality}_expectile{config.tau}_seed{config.seed}_{config.run_id}.log"
     log_filepath = os.path.join(config.log_dir, log_filename)
 
     for handler in logging.root.handlers[:]:
@@ -574,7 +586,12 @@ def train_iql(config: IQLConfig):
         'actions': new_actions,  # Use relabeled actions!
     }
     if 'rewards' in dataset:
-        dataset_dict['rewards'] = dataset['rewards']
+        if config.normalize_rewards:
+            # Apply scaling / 100.0 as standard practice
+            dataset_dict['rewards'] = dataset['rewards'] / 100.0
+            logging.info("⚡ Applied reward scaling: rewards / 100.0")
+        else:
+            dataset_dict['rewards'] = dataset['rewards']
     if 'terminals' in dataset:
         dataset_dict['terminals'] = dataset['terminals']
 
@@ -643,16 +660,34 @@ def train_iql(config: IQLConfig):
 
         # Logging
         if (t + 1) % 1000 == 0:
-            log_msg = (f"Step {t+1}/{config.max_timesteps}: "
-                      f"value_loss={metrics['value_loss']:.6f}, "
-                      f"critic_loss={metrics['critic_loss']:.6f}, "
-                      f"actor_loss={metrics['actor_loss']:.6f}, "
-                      f"v_value={metrics['v_value']:.4f}, "
-                      f"advantage={metrics['advantage']:.4f}")
-            logging.info(log_msg)
+            # 构建统一的 SwanLab 指标字典（带命名空间前缀）
+            swanlab_metrics = {
+                # 公共指标
+                "train/actor_loss": metrics['actor_loss'],
+                "train/actor_grad_norm": metrics['actor_grad_norm'],
+                # Critic/Q 指标
+                "train/critic_loss": metrics['critic_loss'],
+                "train/critic_grad_norm": metrics['critic_grad_norm'],
+                "train/q_value_mean": metrics['q_value'],
+                "train/q_value_std": metrics['q_value_std'],
+                "train/target_q_mean": metrics['target_q'],
+                # IQL 特有指标
+                "train/value_loss": metrics['value_loss'],
+                "train/v_value_mean": metrics['v_value'],
+                "train/advantage_mean": metrics['advantage'],
+                "train/advantage_std": metrics['advantage_std'],
+                "train/value_grad_norm": metrics['value_grad_norm'],
+            }
+
+            # 全量本地日志记录（与 SwanLab 完全一致）
+            log_parts = [f"Step {t+1}/{config.max_timesteps}:"]
+            for key, value in swanlab_metrics.items():
+                short_key = key.replace("train/", "")
+                log_parts.append(f"{short_key}={value:.6f}")
+            logging.info(", ".join(log_parts))
 
             if swan_logger:
-                swan_logger.log_metrics(metrics, step=t+1)
+                swan_logger.log_metrics(swanlab_metrics, step=t+1)
 
         # Evaluation
         if eval_env is not None and (t + 1) % config.eval_freq == 0:
@@ -681,14 +716,14 @@ def train_iql(config: IQLConfig):
         if (t + 1) % config.save_freq == 0:
             checkpoint_path = os.path.join(
                 config.checkpoint_dir,
-                f"iql_{config.env_name}_{config.dataset_quality}_expectile{config.tau}_step{t+1}.pt"
+                f"iql_{config.env_name}_{config.dataset_quality}_tau{config.tau}_beta{config.beta}_lr{config.actor_lr}_seed{config.seed}_{config.run_id}_step{t+1}.pt"
             )
             agent.save(checkpoint_path)
 
     # Final save
     final_path = os.path.join(
         config.checkpoint_dir,
-        f"iql_{config.env_name}_{config.dataset_quality}_expectile{config.tau}_final.pt"
+        f"iql_{config.env_name}_{config.dataset_quality}_tau{config.tau}_beta{config.beta}_lr{config.actor_lr}_seed{config.seed}_{config.run_id}_final.pt"
     )
     agent.save(final_path)
 
@@ -738,6 +773,8 @@ if __name__ == "__main__":
                         help="数据集质量")
     parser.add_argument("--seed", type=int, default=58407201,
                         help="随机种子")
+    parser.add_argument("--run_id", type=str, default="",
+                        help="唯一运行标识符 (格式: MMDD_HHMM, 如果为空则自动生成)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="设备")
 
@@ -792,6 +829,7 @@ if __name__ == "__main__":
         env_name=args.env_name,
         dataset_quality=args.dataset_quality,
         seed=args.seed,
+        run_id=args.run_id,
         device=args.device,
         dataset_path=args.dataset_path,
         max_timesteps=args.max_timesteps,

@@ -157,6 +157,10 @@ class CQLAgent:
             else:
                 target_q = target_q * self.config.gamma
 
+            # 🔧 HOT-FIX: Target Q Clamping (防止Q值爆炸)
+            # 由于reward已经缩放到 [-1, 1] 范围,Q值应该在 [-10, 10] 范围内
+            target_q = torch.clamp(target_q, -10.0, 10.0)
+
         # Current Q values (detach s_critic to avoid gradient conflict)
         current_q1 = self.critic_1.q1(s_critic.detach(), true_actions)
         current_q2 = self.critic_2.q1(s_critic.detach(), true_actions)
@@ -179,6 +183,11 @@ class CQLAgent:
         # Optimize critics
         self.critic_optimizer.zero_grad()
         total_critic_loss.backward()
+        # 🔧 HOT-FIX: Critic Gradient Clipping (防止梯度爆炸)
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            list(self.critic_1.parameters()) + list(self.critic_2.parameters()),
+            10.0  # 从 float('inf') 改为 10.0
+        )
         self.critic_optimizer.step()
 
         # Step 4: Actor Update
@@ -194,6 +203,8 @@ class CQLAgent:
         # Optimize actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        # 🔧 HOT-FIX: Actor Gradient Clipping (防止梯度爆炸)
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100.0)  # 从 float('inf') 改为 100.0
         self.actor_optimizer.step()
 
         # Update target networks
@@ -203,8 +214,19 @@ class CQLAgent:
         return {
             "critic_loss": critic_loss.item(),
             "cql_loss": cql_loss.item(),
+            "total_critic_loss": total_critic_loss.item(),
             "actor_loss": actor_loss.item(),
             "q_value": current_q1.mean().item(),
+            "q1_value": current_q1.mean().item(),
+            "q2_value": current_q2.mean().item(),
+            "q_std": current_q1.std().item(),
+            "random_q": random_q1.mean().item(),
+            "target_q": target_q.mean().item(),
+            # 🔧 HOT-FIX: 新增诊断指标
+            "target_q_max": target_q.max().item(),
+            "target_q_min": target_q.min().item(),
+            "critic_grad_norm": critic_grad_norm.item(),
+            "actor_grad_norm": actor_grad_norm.item(),
         }
 
     @torch.no_grad()
@@ -335,7 +357,7 @@ def train_cql(config: CQLConfig):
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-    log_filename = f"{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_seed{config.seed}_{timestamp}.log"
+    log_filename = f"{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_seed{config.seed}_{config.run_id}.log"
     log_filepath = os.path.join(config.log_dir, log_filename)
 
     for handler in logging.root.handlers[:]:
@@ -507,7 +529,12 @@ def train_cql(config: CQLConfig):
         'actions': new_actions,  # Use relabeled actions!
     }
     if 'rewards' in dataset:
-        dataset_dict['rewards'] = dataset['rewards']
+        if config.normalize_rewards:
+            # Apply scaling / 100.0 as standard practice
+            dataset_dict['rewards'] = dataset['rewards'] / 100.0
+            logging.info("⚡ Applied reward scaling: rewards / 100.0")
+        else:
+            dataset_dict['rewards'] = dataset['rewards']
     if 'terminals' in dataset:
         dataset_dict['terminals'] = dataset['terminals']
 
@@ -582,15 +609,37 @@ def train_cql(config: CQLConfig):
 
         # Logging
         if (t + 1) % 1000 == 0:
-            log_msg = (f"Step {t+1}/{config.max_timesteps}: "
-                      f"critic_loss={metrics['critic_loss']:.6f}, "
-                      f"cql_loss={metrics['cql_loss']:.6f}, "
-                      f"actor_loss={metrics['actor_loss']:.6f}, "
-                      f"q_value={metrics['q_value']:.4f}")
-            logging.info(log_msg)
+            # 构建统一的 SwanLab 指标字典（带命名空间前缀）
+            swanlab_metrics = {
+                # 公共指标
+                "train/actor_loss": metrics['actor_loss'],
+                "train/actor_grad_norm": metrics['actor_grad_norm'],
+                # Critic/Q 指标
+                "train/critic_loss": metrics['critic_loss'],
+                "train/critic_grad_norm": metrics['critic_grad_norm'],
+                "train/q_value_mean": metrics['q_value'],
+                "train/q1_value": metrics['q1_value'],
+                "train/q2_value": metrics['q2_value'],
+                "train/q_value_std": metrics['q_std'],
+                "train/target_q_mean": metrics['target_q'],
+                # 🔧 HOT-FIX: 新增诊断指标
+                "train/target_q_max": metrics['target_q_max'],
+                "train/target_q_min": metrics['target_q_min'],
+                # CQL 特有指标
+                "train/cql_loss": metrics['cql_loss'],
+                "train/total_critic_loss": metrics['total_critic_loss'],
+                "train/random_q": metrics['random_q'],
+            }
+
+            # 全量本地日志记录（与 SwanLab 完全一致）
+            log_parts = [f"Step {t+1}/{config.max_timesteps}:"]
+            for key, value in swanlab_metrics.items():
+                short_key = key.replace("train/", "")
+                log_parts.append(f"{short_key}={value:.6f}")
+            logging.info(", ".join(log_parts))
 
             if swan_logger:
-                swan_logger.log_metrics(metrics, step=t+1)
+                swan_logger.log_metrics(swanlab_metrics, step=t+1)
 
         # Evaluation
         if eval_env is not None and (t + 1) % config.eval_freq == 0:
@@ -619,14 +668,14 @@ def train_cql(config: CQLConfig):
         if (t + 1) % config.save_freq == 0:
             checkpoint_path = os.path.join(
                 config.checkpoint_dir,
-                f"cql_{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_step{t+1}.pt"
+                f"cql_{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_lr{config.actor_lr}_seed{config.seed}_{config.run_id}_step{t+1}.pt"
             )
             agent.save(checkpoint_path)
 
     # Final save
     final_path = os.path.join(
         config.checkpoint_dir,
-        f"cql_{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_final.pt"
+        f"cql_{config.env_name}_{config.dataset_quality}_alpha{config.alpha}_lr{config.actor_lr}_seed{config.seed}_{config.run_id}_final.pt"
     )
     agent.save(final_path)
 
@@ -676,6 +725,8 @@ if __name__ == "__main__":
                         help="数据集质量")
     parser.add_argument("--seed", type=int, default=58407201,
                         help="随机种子")
+    parser.add_argument("--run_id", type=str, default="",
+                        help="唯一运行标识符 (格式: MMDD_HHMM, 如果为空则自动生成)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="设备")
 
@@ -726,6 +777,7 @@ if __name__ == "__main__":
         env_name=args.env_name,
         dataset_quality=args.dataset_quality,
         seed=args.seed,
+        run_id=args.run_id,
         device=args.device,
         dataset_path=args.dataset_path,
         max_timesteps=args.max_timesteps,
