@@ -200,7 +200,8 @@ class OfflineSlateDataModule(pl.LightningDataModule):
         batch_size: int = 256,
         num_workers: int = 4,
         val_split: float = 0.1,
-        load_oracle: bool = False
+        load_oracle: bool = False,
+        dataset_path: Optional[Union[str, Path]] = None
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -211,8 +212,11 @@ class OfflineSlateDataModule(pl.LightningDataModule):
         self.val_split = val_split
         self.load_oracle = load_oracle
 
-        # Construct data path
-        self.data_path = self.data_dir / env_name / f"{quality}_data_d4rl.npz"
+        # Construct data path (or use provided path)
+        if dataset_path is not None:
+            self.data_path = Path(dataset_path)
+        else:
+            self.data_path = self.data_dir / env_name / f"{quality}_data_d4rl.npz"
 
         # Datasets (initialized in setup)
         self.train_dataset = None

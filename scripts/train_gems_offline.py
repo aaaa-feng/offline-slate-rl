@@ -25,8 +25,12 @@ import pytorch_lightning as pl
 from pathlib import Path
 import sys
 import os
+from datetime import datetime
 from pytorch_lightning.callbacks import RichProgressBar, ModelCheckpoint
 from argparse import ArgumentParser
+
+# Save original command line arguments for logging
+_original_argv = sys.argv.copy()
 
 # Add project paths
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -52,10 +56,14 @@ def create_parser():
 
     # Data arguments
     parser.add_argument("--data_dir", type=str,
-                       default="data/datasets/offline_v2",
+                       default="data/datasets/offline",
                        help="Directory containing offline datasets")
-    parser.add_argument("--env_name", type=str, required=True,
-                       choices=["diffuse_topdown", "diffuse_mix", "diffuse_divpen"],
+    parser.add_argument("--dataset_path", type=str, default=None,
+                       help="Direct path to dataset file (overrides env_name/quality)")
+    parser.add_argument("--env_name", type=str, required=False,
+                       choices=["diffuse_topdown", "diffuse_mix", "diffuse_divpen",
+                               "diffuse_mix_bt3_dp5", "diffuse_mix_bt5_dp5",
+                               "diffuse_topdown_bt3_dp5", "diffuse_topdown_bt5_dp5"],
                        help="Environment name")
     parser.add_argument("--quality", type=str, default="expert",
                        choices=["expert", "medium", "random"],
@@ -146,6 +154,19 @@ def main():
     parser = create_parser()
     args = parser.parse_args()
 
+    # Print execution command and parameters at the very beginning
+    print("=" * 100)
+    print("=== OFFLINE GeMS TRAINING - EXECUTION RECORD ===")
+    print("=" * 100)
+    print(f"Execution Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\nFull Command:")
+    print(f"python {' '.join(_original_argv)}")
+    print(f"\nAll Parameters:")
+    for key, value in sorted(vars(args).items()):
+        print(f"  {key}: {value}")
+    print("=" * 100)
+    print()
+
     # Auto-generate run name if not provided
     if args.run_name is None:
         args.run_name = f"gems_{args.env_name}_{args.quality}_latent{args.latent_dim}_seed{args.seed}"
@@ -198,12 +219,13 @@ def main():
     print("### Setting up DataModule...")
     data_module = OfflineSlateDataModule(
         data_dir=args.data_dir,
-        env_name=args.env_name,
+        env_name=args.env_name or "custom",
         quality=args.quality,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         val_split=args.val_split,
-        load_oracle=False
+        load_oracle=False,
+        dataset_path=args.dataset_path
     )
     print("✓ DataModule created")
 
@@ -231,11 +253,23 @@ def main():
     ckpt_dir = Path(GEMS_CKPT_DIR) / "offline"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt_name = (f"GeMS_{args.env_name}_{args.quality}_"
-                f"latent{args.latent_dim}_"
-                f"beta{args.lambda_KL}_"
-                f"click{args.lambda_click}_"
-                f"seed{args.seed}")
+    # Generate checkpoint name based on dataset source
+    if args.dataset_path:
+        dataset_name = Path(args.dataset_path).stem
+        dataset_name = dataset_name.replace("_data_d4rl", "")
+        ckpt_name = (f"GeMS_{dataset_name}_"
+                    f"{args.fixed_embedds}_"
+                    f"latent{args.latent_dim}_"
+                    f"beta{args.lambda_KL}_"
+                    f"click{args.lambda_click}_"
+                    f"seed{args.seed}")
+    else:
+        ckpt_name = (f"GeMS_{args.env_name}_{args.quality}_"
+                    f"{args.fixed_embedds}_"
+                    f"latent{args.latent_dim}_"
+                    f"beta{args.lambda_KL}_"
+                    f"click{args.lambda_click}_"
+                    f"seed{args.seed}")
 
     print(f"### Checkpoint will be saved to: {ckpt_dir}/{ckpt_name}.ckpt")
 

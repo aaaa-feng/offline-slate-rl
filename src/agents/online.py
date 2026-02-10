@@ -315,6 +315,40 @@ class SAC(DQN):
         '''
             Action selection using the Squashed Diagonal Gaussian Actor
         '''
+        # ============================================================================
+        # FIX: Handle dict state when using --beliefs actor critic
+        # ============================================================================
+        # Date: 2026-01-17
+        # Issue: When using POMDP with --beliefs actor critic, belief.forward()
+        #        returns a dict like {"actor": tensor, "critic": tensor}, but the
+        #        original code expected a single tensor, causing:
+        #        "'dict' object has no attribute 'shape'" error at line 318
+        #
+        # Root Cause:
+        #   - In online_loops.py line 267: obs = self.belief.forward(obs)
+        #   - GRUBelief.forward() returns dict when --beliefs contains multiple modules
+        #   - This dict is passed to get_action() which expects tensor
+        #
+        # Solution: Extract the "actor" tensor from dict for action selection
+        #   - Priority: "actor" > "belief" > first value
+        #   - Backward compatible: if state is tensor, no change
+        #
+        # Impact:
+        #   - Fixes: bt3_dp5 experiments with --beliefs actor critic
+        #   - Safe: isinstance() check ensures no impact on non-POMDP cases
+        #   - Propagates: SlateQ.get_action() calls super().get_action(), auto-fixed
+        #
+        # Rollback: If this causes issues, comment out lines below and uncomment
+        #           the original line 318 (now line 344)
+        # ============================================================================
+        if isinstance(state, dict):
+            # Extract actor state for action selection
+            state = state.get("actor", state.get("belief", list(state.values())[0]))
+
+        # Original code (kept for reference, now handled by the fix above):
+        # if len(state.shape) == 1: # When not in a batch
+        #     state = state.unsqueeze(0)
+
         if len(state.shape) == 1: # When not in a batch
             state = state.unsqueeze(0)
         # Get policy params

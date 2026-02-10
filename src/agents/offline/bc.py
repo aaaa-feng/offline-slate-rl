@@ -28,6 +28,7 @@ from common.offline.buffer import ReplayBuffer, TrajectoryReplayBuffer
 from common.offline.utils import set_seed, compute_mean_std
 from common.offline.networks import Actor
 from common.offline.eval_env import OfflineEvalEnv
+from common.offline.checkpoint_utils import resolve_gems_checkpoint
 from belief_encoders.gru_belief import GRUBelief
 from rankers.gems.item_embeddings import ItemEmbeddings
 
@@ -48,6 +49,7 @@ class BCAgent:
         action_dim: int,
         config: BCConfig,
         ranker_params: Dict,  # 🔥 新增：接收 Ranker 参数
+        ranker=None,  # 🔥 Solution B: Accept ranker for real-time inference
     ):
         self.config = config
         self.device = torch.device(config.device)
@@ -56,6 +58,9 @@ class BCAgent:
         # ========================================================================
         # 🔥 关键：从 Ranker 参数中提取组件（复刻在线逻辑）
         # ========================================================================
+
+        # 0. Ranker for real-time action inference (Solution B)
+        self.ranker = ranker
 
         # 1. Action Bounds（直接使用 Ranker 的）
         self.action_center = ranker_params['action_center'].to(self.device)
@@ -122,7 +127,6 @@ class BCAgent:
 
         Args:
             batch: TrajectoryBatch with obs (Dict with 'slate' and 'clicks' as List[Tensor])
-                   and actions (List[Tensor])
         """
         self.total_it += 1
 
@@ -130,8 +134,14 @@ class BCAgent:
         states, _ = self.belief.forward_batch(batch)
         state = states["actor"]  # [sum_seq_lens, belief_hidden_dim]
 
-        # Concatenate actions
-        true_actions = torch.cat(batch.actions, dim=0)  # [sum_seq_lens, action_dim]
+        # 🔥 Solution B: Real-time action inference from slates/clicks
+        flat_slates = torch.cat(batch.obs["slate"], dim=0)  # [sum_seq_lens, rec_size]
+        flat_clicks = torch.cat(batch.obs["clicks"], dim=0)  # [sum_seq_lens, rec_size]
+
+        with torch.no_grad():
+            true_actions, _ = self.ranker.run_inference(flat_slates, flat_clicks)
+            # Normalize actions
+            true_actions = (true_actions - self.action_center) / self.action_scale
 
         # Actor prediction
         pred_actions = self.actor(state)  # [sum_seq_lens, action_dim]
@@ -355,20 +365,17 @@ def train_bc(config: BCConfig):
     # ========================================================================
     from rankers.gems.rankers import GeMS
 
-    # 1. 构建 GeMS Checkpoint 路径
-    gems_checkpoint_name = (
-        f"GeMS_{config.env_name}_{config.dataset_quality}_"
-        f"latent32_beta1.0_click0.5_seed58407201"
-    )
-    gems_path = (
-        f"/data/liyuefeng/offline-slate-rl/checkpoints/gems/offline/"
-        f"{gems_checkpoint_name}.ckpt"
+    # 1. 使用统一配置模块解析 GeMS Checkpoint 路径和参数
+    gems_path, lambda_click = resolve_gems_checkpoint(
+        env_name=config.env_name,
+        dataset_quality=config.dataset_quality
     )
 
     logging.info("=" * 80)
     logging.info("=== Loading Pretrained GeMS (Replicating Online Logic) ===")
     logging.info("=" * 80)
     logging.info(f"Checkpoint: {gems_path}")
+    logging.info(f"Lambda click: {lambda_click}")
 
     # 2. 加载 GeMS Ranker
     # 🔥 关键：先创建临时 ItemEmbeddings 用于加载 GeMS
@@ -386,7 +393,7 @@ def train_bc(config: BCConfig):
         item_embedd_dim=config.item_embedd_dim,
         num_items=config.num_items,
         latent_dim=32,  # 从 checkpoint 名称获取
-        lambda_click=0.5,  # 从 checkpoint 名称获取
+        lambda_click=lambda_click,  # 动态参数
         lambda_KL=1.0,  # 从 checkpoint 名称获取
         lambda_prior=1.0,
         ranker_lr=3e-3,
@@ -437,76 +444,24 @@ def train_bc(config: BCConfig):
     logging.info(f"Dataset statistics:")
     logging.info(f"  Slates shape: {dataset['slates'].shape}")
     logging.info(f"  Clicks shape: {dataset['clicks'].shape}")
-    logging.info(f"  Actions shape: {dataset['actions'].shape}")
+    logging.info(f"  Next slates shape: {dataset['next_slates'].shape}")
+    logging.info(f"  Next clicks shape: {dataset['next_clicks'].shape}")
     logging.info(f"  Total transitions: {len(dataset['slates'])}")
 
     # ========================================================================
-    # 内存重打标 (In-Memory Action Relabeling) - Zero Trust Strategy
+    # 🔥 Solution B: Real-time Action Inference (No Pre-computed Actions)
     # ========================================================================
     logging.info("")
     logging.info("=" * 80)
-    logging.info("⚠️  IN-MEMORY ACTION RELABELING")
+    logging.info("✅ Using Real-time Action Inference (Solution B)")
     logging.info("=" * 80)
-    logging.info("Strategy: Zero Trust - Regenerate all actions using current GeMS")
-    logging.info("Reason:   Ensure absolute consistency between training and inference")
-
-    # 1. Extract raw discrete data
-    raw_slates = torch.tensor(dataset['slates'], device=config.device, dtype=torch.long)
-    raw_clicks = torch.tensor(dataset['clicks'], device=config.device, dtype=torch.float)
-    total_samples = len(raw_slates)
-
-    # 2. Batch inference to regenerate actions
-    batch_size = 1000
-    new_actions_list = []
-
-    with torch.no_grad():
-        for i in range(0, total_samples, batch_size):
-            batch_slates = raw_slates[i:i+batch_size]
-            batch_clicks = raw_clicks[i:i+batch_size]
-
-            # Key: Use current GeMS Encoder to infer latent actions
-            mu, _ = ranker.run_inference(batch_slates, batch_clicks)
-            new_actions_list.append(mu.cpu().numpy())
-
-            if (i + batch_size) % 100000 == 0 or (i + batch_size) >= total_samples:
-                processed = min(i + batch_size, total_samples)
-                logging.info(f"  Progress: {processed:,}/{total_samples:,}")
-
-    new_actions = np.concatenate(new_actions_list, axis=0)
-
-    # 3. Action statistics validation
-    logging.info("Action Statistics (Primary Quality Indicator):")
-    logging.info(f"  Mean:  {new_actions.mean():.6f} (expect ≈ 0)")
-    logging.info(f"  Std:   {new_actions.std():.6f}  (expect ≈ 1)")
-    logging.info(f"  Min:   {new_actions.min():.6f}")
-    logging.info(f"  Max:   {new_actions.max():.6f}")
-
-    # 4. GeMS reconstruction quality test (Informational only, no blocking)
-    logging.info("")
-    logging.info("GeMS Reconstruction Quality Test (Informational Only):")
-    test_size = min(100, len(raw_slates))
-    test_slates = raw_slates[:test_size]
-    test_clicks = raw_clicks[:test_size]
-    with torch.no_grad():
-        test_actions, _ = ranker.run_inference(test_slates, test_clicks)
-        # Loop decoding (ranker.rank does not support batch input)
-        matches_list = []
-        for i in range(test_size):
-            reconstructed = ranker.rank(test_actions[i])
-            match = (test_slates[i] == reconstructed).float().mean().item()
-            matches_list.append(match)
-        matches = np.mean(matches_list)
-    logging.info(f"  Exact match accuracy: {matches:.4f}")
-    logging.info("  Note: Low accuracy is normal for slate ranking tasks")
-
-    # 5. Overwrite old actions
-    logging.info("")
-    logging.info("✅ Action relabeling complete. Overwriting dataset actions.")
+    logging.info("Strategy: Infer actions on-the-fly during training from slates/clicks")
+    logging.info("Benefits: No preprocessing overhead, supports ranker fine-tuning")
     logging.info("=" * 80)
     logging.info("")
 
-    # Get dimensions
-    action_dim = dataset['actions'].shape[1]
+    # Get action dimension from ranker
+    action_dim = ranker.latent_dim
 
     logging.info(f"\nEnvironment info:")
     logging.info(f"  Action dim: {action_dim}")
@@ -516,34 +471,50 @@ def train_bc(config: BCConfig):
     # Create trajectory replay buffer
     replay_buffer = TrajectoryReplayBuffer(device=config.device)
 
-    # 6. Load data with relabeled actions
+    # 6. Load data (V4 format - no pre-computed actions)
     dataset_dict = {
         'episode_ids': dataset['episode_ids'],
         'slates': dataset['slates'],
         'clicks': dataset['clicks'],
-        'actions': new_actions,  # Use relabeled actions!
+        'next_slates': dataset['next_slates'],  # ✅ Required by TrajectoryReplayBuffer
+        'next_clicks': dataset['next_clicks'],  # ✅ Required by TrajectoryReplayBuffer
+        'rewards': dataset['rewards'],
+        'terminals': dataset['terminals'],
     }
-
-    # 可选字段
-    if 'rewards' in dataset:
-        dataset_dict['rewards'] = dataset['rewards']
-    if 'terminals' in dataset:
-        dataset_dict['terminals'] = dataset['terminals']
 
     replay_buffer.load_d4rl_dataset(dataset_dict)
     logging.info(f"✅ Buffer loaded successfully")
 
-    # 🔥 关键：从 Buffer 计算 Action Bounds（架构师方案）
-    # 使用数据集的实际统计值，而不是 GeMS checkpoint 中的值
-    logging.info("Calculating action bounds from buffer...")
-    action_center, action_scale = replay_buffer.get_action_normalization_params()
-    logging.info(f"✅ Action bounds calculated from buffer")
+    # ========================================================================
+    # 🔥 Compute Action Normalization (TD3+BC approach)
+    # ========================================================================
+    logging.info("")
+    logging.info("Computing action normalization parameters...")
+
+    # Sample a batch of slates/clicks to compute action statistics
+    sample_size = min(10000, len(dataset['slates']))
+    sample_indices = np.random.choice(len(dataset['slates']), sample_size, replace=False)
+    sample_slates = torch.tensor(dataset['slates'][sample_indices], device=config.device, dtype=torch.long)
+    sample_clicks = torch.tensor(dataset['clicks'][sample_indices], device=config.device, dtype=torch.float)
+
+    # Infer actions from samples
+    with torch.no_grad():
+        sample_actions, _ = ranker.run_inference(sample_slates, sample_clicks)
+
+    # Compute normalization parameters
+    action_min = sample_actions.min(dim=0)[0]
+    action_max = sample_actions.max(dim=0)[0]
+    action_center = (action_max + action_min) / 2
+    action_scale = (action_max - action_min) / 2 + 1e-6
+
+    logging.info(f"✅ Action normalization computed from {sample_size} samples")
     logging.info(f"  center shape: {action_center.shape}")
     logging.info(f"  center mean: {action_center.mean().item():.6f}")
     logging.info(f"  scale shape: {action_scale.shape}")
     logging.info(f"  scale mean: {action_scale.mean().item():.6f}")
+    logging.info("")
 
-    # 更新 ranker_params 中的 action bounds
+    # Update ranker_params with computed action bounds
     ranker_params['action_center'] = action_center
     ranker_params['action_scale'] = action_scale
 
@@ -552,6 +523,7 @@ def train_bc(config: BCConfig):
         action_dim=action_dim,
         config=config,
         ranker_params=ranker_params,  # 🔥 传入 Ranker 参数
+        ranker=ranker,  # 🔥 Solution B: Pass ranker for real-time inference
     )
 
     # Initialize SwanLab
@@ -712,8 +684,7 @@ if __name__ == "__main__":
     parser.add_argument("--env_name", type=str, default="diffuse_mix",
                         help="环境名称")
     parser.add_argument("--dataset_quality", type=str, default="expert",
-                        choices=["random", "medium", "expert"],
-                        help="数据集质量")
+                        help="数据集质量 (旧benchmark: random/medium/expert, 新benchmark: v2_b3/v2_b5)")
     parser.add_argument("--seed", type=int, default=58407201,
                         help="随机种子")
     parser.add_argument("--run_id", type=str, default="",

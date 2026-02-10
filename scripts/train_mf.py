@@ -9,6 +9,7 @@ import torch
 import pytorch_lightning as pl
 import random
 from pathlib import Path
+from datetime import datetime
 
 import sys
 import os
@@ -28,6 +29,19 @@ argparser = MFEmbeddings.add_model_specific_args(argparser)  # MF-specific param
 args = argparser.parse_args()
 arg_dict = vars(args)
 
+# Print execution command and parameters at the very beginning
+print("=" * 100)
+print("=== MF EMBEDDING TRAINING - EXECUTION RECORD ===")
+print("=" * 100)
+print(f"Execution Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"\nFull Command:")
+print(f"python {' '.join(sys.argv)}")
+print(f"\nAll Parameters:")
+for key, value in sorted(arg_dict.items()):
+    print(f"  {key}: {value}")
+print("=" * 100)
+print()
+
 # Seeds for reproducibility
 seed = 2022
 torch.manual_seed(seed)
@@ -45,10 +59,16 @@ print("=" * 80)
 print("=== Matrix Factorization Training ===")
 print("=" * 80)
 print(f"Dataset: {dataset_path}")
-print(f"Output: {output_dir}")
+if args.output_path:
+    print(f"Output: {args.output_path} (custom path)")
+else:
+    print(f"Output: {output_dir} (default directory)")
 print("=" * 80)
 
 item_embeddings = MFEmbeddings(**arg_dict)
-item_embeddings.train(dataset_path, output_dir)
+item_embeddings.train(dataset_path, output_dir, output_path=args.output_path)
 
-print(f"### MF training complete. Embeddings saved to: {output_dir}")
+if args.output_path:
+    print(f"### MF training complete. Embeddings saved to: {args.output_path}")
+else:
+    print(f"### MF training complete. Embeddings saved to: {output_dir}")

@@ -119,6 +119,10 @@ class GRUBelief(BeliefEncoder):
             self.gru[module] = GRU(self.input_dim, self.hidden_dim, num_layers = 1, batch_first = True).to(self.my_device)
             self.hidden[module] = torch.zeros(1, 1, self.hidden_dim, device = self.my_device)
 
+        # ✅ 新增：共享GRU（用于TD3+BC改进版）
+        self.gru["shared"] = GRU(self.input_dim, self.hidden_dim, num_layers=1, batch_first=True).to(self.my_device)
+        self.hidden["shared"] = torch.zeros(1, 1, self.hidden_dim, device=self.my_device)
+
     @staticmethod
     def add_model_specific_args(parent_parser) -> MyParser:
         parser = MyParser(parents=[BeliefEncoder.add_model_specific_args(parent_parser)], add_help=False)
@@ -188,4 +192,41 @@ class GRUBelief(BeliefEncoder):
             states[module] = torch.cat([states[module][i, :lens[i], :] for i in range(batch_size)], dim = 0) # (sum_seq_lens, belief_state_dim)
             next_states[module] = torch.cat([states[module][1:].detach(), torch.zeros(1, self.hidden_dim, device = self.my_device)], dim = 0) # (sum_seq_lens, belief_state_dim)
 
+        return states, next_states
+
+    def forward_batch_shared(self, batch):
+        """用于TD3+BC改进版的单流共享GRU前向传播"""
+        lens = [len(clicks) for clicks in batch.obs["clicks"]]
+        batch_size = len(batch.obs["clicks"])
+
+        # 使用actor的item_embeddings
+        item_embeddings = [self.item_embeddings["actor"](rl)
+                           for rl in batch.obs["slate"]]
+
+        obs_embedd = [torch.cat([embedd, clicks.float().unsqueeze(2)], dim=2).flatten(start_dim=1)
+                      for embedd, clicks in zip(item_embeddings, batch.obs["clicks"])]
+
+        obs_embedd = torch.nn.utils.rnn.pad_sequence(obs_embedd, batch_first=True)
+        obs_embedd = torch.nn.utils.rnn.pack_padded_sequence(
+            obs_embedd, lens, batch_first=True, enforce_sorted=False)
+
+        hidden = torch.zeros(1, batch_size, self.hidden_dim, device=self.my_device)
+        states, _ = self.gru["shared"](obs_embedd, hidden)
+
+        states, _ = torch.nn.utils.rnn.pad_packed_sequence(states, batch_first=True)
+        states = torch.cat([states[i, :lens[i], :] for i in range(batch_size)], dim=0)
+
+        # ⚠️ 关键：正确处理Episode边界
+        next_states_list = []
+        start_idx = 0
+        for length in lens:
+            episode_states = states[start_idx:start_idx+length]
+            episode_next_states = torch.cat([
+                episode_states[1:].detach(),
+                torch.zeros(1, self.hidden_dim, device=self.my_device)
+            ], dim=0)
+            next_states_list.append(episode_next_states)
+            start_idx += length
+
+        next_states = torch.cat(next_states_list, dim=0)
         return states, next_states

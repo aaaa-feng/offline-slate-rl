@@ -86,6 +86,8 @@ class MFEmbeddings(ItemEmbeddings):
     def add_model_specific_args(parent_parser) -> MyParser:
         parser = MyParser(parents=[ItemEmbeddings.add_model_specific_args(parent_parser)], add_help=False)
         parser.add_argument('--MF_dataset', type=str, default = None)
+        parser.add_argument('--output_path', type=str, default = None,
+                          help='Custom output path for the trained embedding (full path including filename). If not provided, uses default naming.')
         parser.add_argument('--train_val_split_MF', type=float, default = 0.1)
         parser.add_argument('--batch_size_MF', type=int, default = 256)
         parser.add_argument('--lr_MF', type=float, default = 1e-4)
@@ -98,11 +100,36 @@ class MFEmbeddings(ItemEmbeddings):
         return {"user_ids" : torch.tensor([b[0] for b in batch], dtype = torch.long, device = self.device),
                 "item_ids" : torch.tensor([b[1] for b in batch], dtype = torch.long, device = self.device)}
 
-    def train(self, dataset_path : str, data_dir : str) -> None:
+    def train(self, dataset_path : str, data_dir : str, output_path : str = None) -> None:
         '''
             Train MF item embeddings on pre-collected dataset.
+
+            Args:
+                dataset_path: Path to the training dataset
+                data_dir: Default output directory (used if output_path is None)
+                output_path: Custom output path (full path including filename). If provided, overrides data_dir.
         '''
+        from datetime import datetime
+
+        train_start_time = datetime.now()
+        print("\n" + "=" * 80)
+        print("=== MF TRAINING STARTED ===")
+        print("=" * 80)
+        print(f"Start Time: {train_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Dataset: {dataset_path}")
+        if output_path:
+            print(f"Output Path: {output_path} (custom)")
+        else:
+            print(f"Output Directory: {data_dir} (default)")
+        print(f"Embedding Dimension: {self.embedd_dim}")
+        print(f"Learning Rate: {self.lr}")
+        print(f"Batch Size: {self.batch_size}")
+        print(f"Patience: {self.patience}")
+        print("=" * 80)
+        print()
+
         ### Loading the data and pre-processing
+        print("Loading dataset...")
         data = torch.load(dataset_path)
         num_user = len(data)
 
@@ -112,9 +139,13 @@ class MFEmbeddings(ItemEmbeddings):
         train_dataset = MFDataset(data = train_data)
         val_dataset = MFDataset(data = val_data)
 
-        print("Number of interactions :")
-        print("In training set : ", len(train_dataset))
-        print("In validation set : ", len(val_dataset))
+        print("\nDataset Statistics:")
+        print(f"  Total users: {num_user}")
+        print(f"  Training users: {len(train_data)}")
+        print(f"  Validation users: {len(val_data)}")
+        print(f"  Training interactions: {len(train_dataset)}")
+        print(f"  Validation interactions: {len(val_dataset)}")
+        print()
 
         train_gen = torch.utils.data.DataLoader(train_dataset, batch_size = self.batch_size,
                                                     shuffle = True, collate_fn = self.collate_fn)
@@ -126,9 +157,24 @@ class MFEmbeddings(ItemEmbeddings):
         model = BPRMatrixFactorization(num_user, self.num_items, options, self.device, self.device)
 
         ### Training
+        print("Starting training...")
         epoch = 0
         min_val_loss = 1e10
         count = 0
+        best_epoch = 0
+
+        # Determine final output path
+        if output_path:
+            # Use custom output path
+            final_output_path = output_path
+            # Create parent directory if it doesn't exist
+            parent_dir = os.path.dirname(final_output_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+        else:
+            # Use default naming (original behavior)
+            Path(data_dir).mkdir(parents=True, exist_ok=True)
+            final_output_path = data_dir + dataset_path.split("/")[-1]
 
         while True :
             model.train()
@@ -143,16 +189,20 @@ class MFEmbeddings(ItemEmbeddings):
                         val_loss += loss.item()
                     val_loss /= (k + 1) # Divide by the number of batches
                     model.train()
-                    print("     After %d batches : train_loss = %.4f | val loss = %.4f" % (n, train_loss / 1000, val_loss))
+                    print("  [Epoch %d, Batch %d] train_loss = %.4f | val_loss = %.4f | patience = %d/%d" %
+                          (epoch, n, train_loss / 1000, val_loss, count, self.patience))
 
                     if val_loss < min_val_loss:
                         min_val_loss = val_loss
-                        Path(data_dir).mkdir(parents=True, exist_ok=True)
-                        torch.save(model.item_embeddings.weight.data, data_dir + dataset_path.split("/")[-1])
+                        best_epoch = epoch
+                        torch.save(model.item_embeddings.weight.data, final_output_path)
+                        print(f"  ✓ New best model saved! val_loss = {val_loss:.4f}")
+                        print(f"  ✓ Saved to: {final_output_path}")
                         count = 0
                     else:
                         count += 1
                     if count == self.patience:
+                        print(f"  Early stopping triggered (patience = {self.patience})")
                         break
 
                     train_loss = 0.0
@@ -167,6 +217,31 @@ class MFEmbeddings(ItemEmbeddings):
 
             epoch_loss /= (n + 1) # Divide by the number of batches
 
-
-            print('Epoch {}: train loss {}'.format(epoch, epoch_loss))
+            print('Epoch {}: train_loss = {:.4f}'.format(epoch, epoch_loss))
             epoch += 1
+
+        # Training summary
+        train_end_time = datetime.now()
+        train_duration = train_end_time - train_start_time
+
+        # Load best model and compute statistics
+        best_embeddings = torch.load(final_output_path)
+
+        print("\n" + "=" * 80)
+        print("=== MF TRAINING COMPLETED ===")
+        print("=" * 80)
+        print(f"End Time: {train_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Training Duration: {train_duration}")
+        print(f"\nTraining Summary:")
+        print(f"  Total Epochs: {epoch}")
+        print(f"  Best Epoch: {best_epoch}")
+        print(f"  Best Validation Loss: {min_val_loss:.4f}")
+        print(f"\nEmbedding Statistics:")
+        print(f"  Shape: {best_embeddings.shape}")
+        print(f"  Mean: {best_embeddings.mean().item():.4f}")
+        print(f"  Std: {best_embeddings.std().item():.4f}")
+        print(f"  Min: {best_embeddings.min().item():.4f}")
+        print(f"  Max: {best_embeddings.max().item():.4f}")
+        print(f"\n✓ Final output saved to: {final_output_path}")
+        print("=" * 80)
+        print()

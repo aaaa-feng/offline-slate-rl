@@ -303,21 +303,367 @@ ENV_CONFIGS_FALLBACK: Dict[str, Dict[str, Any]] = {
         "sac_gems_checkpoint": "expert/sac_gems_models/focused_divpen/SAC+GeMS_beta0.5_lambdaclick0.2_seed58407201_gamma0.8.ckpt",
         "gems_checkpoint": "expert/gems_checkpoints/focused_divpen/GeMS_beta0.5_lambdaclick0.2_latentdim32_seed58407201.ckpt",
     },
+
+    # ========== 新增环境配置 (boredom_threshold=3, diversity_penalty=5.0) ==========
+
+    "diffuse_topdown_bt3_dp5": {
+        # 环境标识
+        "env_name": "topics",
+        "dataset_name": "diffuse_topdown_bt3_dp5",
+
+        # Embeddings配置
+        "item_embeddings": "item_embeddings_diffuse.pt",
+        "item_embedds": "scratch",
+
+        # Click model配置
+        "click_model": "tdPBM",
+        "diversity_penalty": 5.0,  # 从 1.0 改为 5.0
+
+        # Ranker配置
+        "ranker": "GeMS",
+        "ranker_dataset": "diffuse_topdown_bt3_dp5",
+        "ranker_embedds": "scratch",
+        "ranker_sample": False,
+        "latent_dim": 32,
+
+        # Belief配置
+        "belief": "GRU",
+        "belief_state_dim": 20,
+
+        # MF checkpoint
+        "MF_checkpoint": "diffuse_topdown_bt3_dp5",
+
+        # 环境参数
+        "num_items": 1000,
+        "item_embedd_dim": 20,
+        "episode_length": 100,
+        "boredom_threshold": 3,  # 从 5 改为 3
+        "recent_items_maxlen": 10,
+        "boredom_moving_window": 5,
+        "env_omega": 0.9,
+        "short_term_boost": 1.0,
+        "env_offset": 0.28,
+        "env_slope": 100,
+        "diversity_threshold": 4,
+        "topic_size": 2,
+        "num_topics": 10,
+
+        # Checkpoint路径 (用于评估) - 新实验暂时为空
+        "sac_gems_checkpoint": "",
+        "gems_checkpoint": "",
+    },
+
+    "diffuse_topdown_bt5_dp5": {
+        # 环境标识
+        "env_name": "topics",
+        "dataset_name": "diffuse_topdown_bt5_dp5",
+
+        # Embeddings配置
+        "item_embeddings": "item_embeddings_diffuse.pt",
+        "item_embedds": "scratch",
+
+        # Click model配置
+        "click_model": "tdPBM",
+        "diversity_penalty": 5.0,
+
+        # Ranker配置
+        "ranker": "GeMS",
+        "ranker_dataset": "diffuse_topdown_bt5_dp5",
+        "ranker_embedds": "scratch",
+        "ranker_sample": False,
+        "latent_dim": 32,
+
+        # Belief配置
+        "belief": "GRU",
+        "belief_state_dim": 20,
+
+        # MF checkpoint
+        "MF_checkpoint": "diffuse_topdown_bt5_dp5",
+
+        # 环境参数
+        "num_items": 1000,
+        "item_embedd_dim": 20,
+        "episode_length": 100,
+        "boredom_threshold": 5,
+        "recent_items_maxlen": 10,
+        "boredom_moving_window": 5,
+        "env_omega": 0.9,
+        "short_term_boost": 1.0,
+        "env_offset": 0.28,
+        "env_slope": 100,
+        "diversity_threshold": 4,
+        "topic_size": 2,
+        "num_topics": 10,
+
+        # Checkpoint路径 (用于评估) - 新实验暂时为空
+        "sac_gems_checkpoint": "",
+        "gems_checkpoint": "",
+    },
+
+    "diffuse_mix_bt3_dp5": {
+        # 环境标识
+        "env_name": "topics",
+        "dataset_name": "diffuse_mix_bt3_dp5",
+
+        # Embeddings配置
+        "item_embeddings": "item_embeddings_diffuse.pt",
+        "item_embedds": "scratch",
+
+        # Click model配置
+        "click_model": "mixPBM",
+        "diversity_penalty": 5.0,  # 从 1.0 改为 5.0
+
+        # Ranker配置
+        "ranker": "GeMS",
+        "ranker_dataset": "diffuse_mix_bt3_dp5",
+        "ranker_embedds": "scratch",
+        "ranker_sample": False,
+        "latent_dim": 32,
+
+        # Belief配置
+        "belief": "GRU",
+        "belief_state_dim": 20,
+
+        # MF checkpoint
+        "MF_checkpoint": "diffuse_mix_bt3_dp5",
+
+        # 环境参数
+        "num_items": 1000,
+        "item_embedd_dim": 20,
+        "episode_length": 100,
+        "boredom_threshold": 3,  # 从 5 改为 3
+        "recent_items_maxlen": 10,
+        "boredom_moving_window": 5,
+        "env_omega": 0.9,
+        "short_term_boost": 1.0,
+        "env_offset": 0.28,
+        "env_slope": 100,
+        "diversity_threshold": 4,
+        "topic_size": 2,
+        "num_topics": 10,
+
+        # Checkpoint路径 (用于评估) - 新实验暂时为空
+        "sac_gems_checkpoint": "",
+        "gems_checkpoint": "",
+    },
+
+    "diffuse_mix_bt5_dp5": {
+        # 环境标识
+        "env_name": "topics",
+        "dataset_name": "diffuse_mix_bt5_dp5",
+
+        # Embeddings配置
+        "item_embeddings": "item_embeddings_diffuse.pt",
+        "item_embedds": "scratch",
+
+        # Click model配置
+        "click_model": "mixPBM",
+        "diversity_penalty": 5.0,
+
+        # Ranker配置
+        "ranker": "GeMS",
+        "ranker_dataset": "diffuse_mix_bt5_dp5",
+        "ranker_embedds": "scratch",
+        "ranker_sample": False,
+        "latent_dim": 32,
+
+        # Belief配置
+        "belief": "GRU",
+        "belief_state_dim": 20,
+
+        # MF checkpoint
+        "MF_checkpoint": "diffuse_mix_bt5_dp5",
+
+        # 环境参数
+        "num_items": 1000,
+        "item_embedd_dim": 20,
+        "episode_length": 100,
+        "boredom_threshold": 5,
+        "recent_items_maxlen": 10,
+        "boredom_moving_window": 5,
+        "env_omega": 0.9,
+        "short_term_boost": 1.0,
+        "env_offset": 0.28,
+        "env_slope": 100,
+        "diversity_threshold": 4,
+        "topic_size": 2,
+        "num_topics": 10,
+
+        # Checkpoint路径 (用于评估) - 新实验暂时为空
+        "sac_gems_checkpoint": "",
+        "gems_checkpoint": "",
+    },
+
+    "diffuse_divpen_bt3_dp5": {
+        # 环境标识
+        "env_name": "topics",
+        "dataset_name": "diffuse_divpen_bt3_dp5",
+
+        # Embeddings配置
+        "item_embeddings": "item_embeddings_diffuse.pt",
+        "item_embedds": "scratch",
+
+        # Click model配置
+        "click_model": "mixPBM",
+        "diversity_penalty": 5.0,  # 从 3.0 改为 5.0
+
+        # Ranker配置
+        "ranker": "GeMS",
+        "ranker_dataset": "diffuse_divpen_bt3_dp5",
+        "ranker_embedds": "scratch",
+        "ranker_sample": False,
+        "latent_dim": 32,
+
+        # Belief配置
+        "belief": "GRU",
+        "belief_state_dim": 20,
+
+        # MF checkpoint
+        "MF_checkpoint": "diffuse_divpen_bt3_dp5",
+
+        # 环境参数
+        "num_items": 1000,
+        "item_embedd_dim": 20,
+        "episode_length": 100,
+        "boredom_threshold": 3,  # 从 5 改为 3
+        "recent_items_maxlen": 10,
+        "boredom_moving_window": 5,
+        "env_omega": 0.9,
+        "short_term_boost": 1.0,
+        "env_offset": 0.28,
+        "env_slope": 100,
+        "diversity_threshold": 4,
+        "topic_size": 2,
+        "num_topics": 10,
+
+        # Checkpoint路径 (用于评估) - 新实验暂时为空
+        "sac_gems_checkpoint": "",
+        "gems_checkpoint": "",
+    },
+
+    # ========================================================================
+    # 新Benchmark环境 (2026-01-17)
+    # 使用V4数据集格式，混合Expert+Medium+Random数据
+    # ========================================================================
+    "mix_divpen": {
+        # 环境标识
+        "env_name": "topics",
+        "dataset_name": "mix_divpen",
+
+        # Embeddings配置
+        "item_embeddings": "item_embeddings_diffuse.pt",
+        "item_embedds": "scratch",
+
+        # Click model配置
+        "click_model": "mixPBM",
+        "diversity_penalty": 5.0,
+
+        # Ranker配置
+        "ranker": "GeMS",
+        "ranker_dataset": "mix_divpen",
+        "ranker_embedds": "scratch",
+        "ranker_sample": False,
+        "latent_dim": 32,
+
+        # Belief配置
+        "belief": "GRU",
+        "belief_state_dim": 20,
+
+        # MF checkpoint
+        "MF_checkpoint": "mix_divpen",
+
+        # 环境参数 (默认使用boredom_threshold=5)
+        "num_items": 1000,
+        "item_embedd_dim": 20,
+        "episode_length": 100,
+        "boredom_threshold": 5,
+        "recent_items_maxlen": 10,
+        "boredom_moving_window": 5,
+        "env_omega": 0.9,
+        "short_term_boost": 1.0,
+        "env_offset": 0.28,
+        "env_slope": 100,
+        "diversity_threshold": 4,
+        "topic_size": 2,
+        "num_topics": 10,
+
+        # Checkpoint路径 (用于评估)
+        "sac_gems_checkpoint": "",
+        "gems_checkpoint": "",
+    },
+
+    "topdown_divpen": {
+        # 环境标识
+        "env_name": "topics",
+        "dataset_name": "topdown_divpen",
+
+        # Embeddings配置
+        "item_embeddings": "item_embeddings_diffuse.pt",
+        "item_embedds": "scratch",
+
+        # Click model配置
+        "click_model": "tdPBM",
+        "diversity_penalty": 5.0,
+
+        # Ranker配置
+        "ranker": "GeMS",
+        "ranker_dataset": "topdown_divpen",
+        "ranker_embedds": "scratch",
+        "ranker_sample": False,
+        "latent_dim": 32,
+
+        # Belief配置
+        "belief": "GRU",
+        "belief_state_dim": 20,
+
+        # MF checkpoint
+        "MF_checkpoint": "topdown_divpen",
+
+        # 环境参数 (默认使用boredom_threshold=5)
+        "num_items": 1000,
+        "item_embedd_dim": 20,
+        "episode_length": 100,
+        "boredom_threshold": 5,
+        "recent_items_maxlen": 10,
+        "boredom_moving_window": 5,
+        "env_omega": 0.9,
+        "short_term_boost": 1.0,
+        "env_offset": 0.28,
+        "env_slope": 100,
+        "diversity_threshold": 4,
+        "topic_size": 2,
+        "num_topics": 10,
+
+        # Checkpoint路径 (用于评估)
+        "sac_gems_checkpoint": "",
+        "gems_checkpoint": "",
+    },
 }
 
 
-def _load_from_dataset_meta(env_name: str) -> Dict[str, Any]:
+def _load_from_dataset_meta(env_name: str, dataset_quality: str = None) -> Dict[str, Any]:
     """
     从 dataset_meta.json 加载环境配置
 
     Args:
         env_name: 环境名称
+        dataset_quality: 数据集质量（如 'v2_b5', 'expert'），如果提供则优先使用新格式
 
     Returns:
         环境配置字典，如果加载失败则返回 None
     """
-    # 构建 expert_data_meta.json 的路径
-    meta_path = DATASETS_ROOT / env_name / "expert_data_meta.json"
+    # 🔥 优先尝试新格式: {env_name}_{dataset_quality}_meta.json
+    if dataset_quality:
+        meta_path = DATASETS_ROOT / env_name / f"{env_name}_{dataset_quality}_meta.json"
+        if meta_path.exists():
+            # 找到新格式的文件，继续加载
+            pass
+        else:
+            # 新格式不存在，尝试旧格式
+            meta_path = DATASETS_ROOT / env_name / "expert_data_meta.json"
+    else:
+        # 没有提供 dataset_quality，使用旧格式
+        meta_path = DATASETS_ROOT / env_name / "expert_data_meta.json"
 
     if not meta_path.exists():
         return None
@@ -390,7 +736,7 @@ def _load_from_dataset_meta(env_name: str) -> Dict[str, Any]:
         return None
 
 
-def get_env_config(env_name: str) -> Dict[str, Any]:
+def get_env_config(env_name: str, dataset_quality: str = None) -> Dict[str, Any]:
     """
     获取指定环境的配置
 
@@ -400,6 +746,7 @@ def get_env_config(env_name: str) -> Dict[str, Any]:
 
     Args:
         env_name: 环境名称 (如 diffuse_mix)
+        dataset_quality: 数据集质量 (如 'v2_b5', 'expert')，用于定位正确的元数据文件
 
     Returns:
         环境配置字典
@@ -408,7 +755,7 @@ def get_env_config(env_name: str) -> Dict[str, Any]:
         ValueError: 如果环境名称不存在
     """
     # 尝试从 dataset_meta.json 加载
-    config = _load_from_dataset_meta(env_name)
+    config = _load_from_dataset_meta(env_name, dataset_quality)
 
     if config is not None:
         # 成功从 dataset_meta.json 加载
@@ -426,10 +773,25 @@ def get_env_config(env_name: str) -> Dict[str, Any]:
     fallback_config = ENV_CONFIGS_FALLBACK[env_name].copy()
     fallback_config["_config_source"] = "hardcoded_fallback"
 
-    warnings.warn(
-        f"Using fallback config for {env_name}. "
-        f"dataset_meta.json not found at {DATASETS_ROOT / env_name / 'expert_data_meta.json'}"
-    )
+    # 构建更详细的警告信息
+    if dataset_quality:
+        tried_paths = [
+            DATASETS_ROOT / env_name / f"{env_name}_{dataset_quality}_meta.json",
+            DATASETS_ROOT / env_name / "expert_data_meta.json"
+        ]
+        warning_msg = (
+            f"Using fallback config for {env_name}. "
+            f"dataset_meta.json not found. Tried:\n"
+            f"  - {tried_paths[0]}\n"
+            f"  - {tried_paths[1]}"
+        )
+    else:
+        warning_msg = (
+            f"Using fallback config for {env_name}. "
+            f"dataset_meta.json not found at {DATASETS_ROOT / env_name / 'expert_data_meta.json'}"
+        )
+
+    warnings.warn(warning_msg)
 
     return fallback_config
 

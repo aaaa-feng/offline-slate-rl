@@ -242,11 +242,40 @@ class AbstractGeMS(Ranker):
         prior_reg = torch.sum(prior_mu.pow(2) + log_prior_var.pow(2))
 
         loss = slate_loss + self.lambda_click * click_loss + self.lambda_KL * KLLoss + self.lambda_prior * prior_reg
-        self.log("train_loss", loss)
-        self.log("train_slateloss", slate_loss)
-        self.log("train_clickloss", click_loss)
-        self.log("train_KLloss", KLLoss)
+
+        ### 7 - Compute accuracy metrics
+        # Slate reconstruction accuracy (Top-1 and Top-5)
+        slate_preds = item_logits.argmax(dim=-1)
+        slate_top1_acc = (slate_preds == slates.flatten()).float().mean()
+
+        # Top-5 accuracy
+        _, slate_top5_preds = item_logits.topk(5, dim=-1)
+        slate_top5_acc = (slate_top5_preds == slates.flatten().unsqueeze(-1)).any(dim=-1).float().mean()
+
+        # Click prediction accuracy
+        click_preds = (torch.sigmoid(click_logits) > 0.5).float()
+        click_acc = (click_preds == clicks.flatten(end_dim=-2)).float().mean()
+
+        ### 8 - Latent space statistics
+        latent_mu_norm = latent_mu.norm(dim=-1).mean()
+        latent_var_mean = latent_var.mean()
+
+        ### 9 - Log all metrics
+        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_slateloss", slate_loss, prog_bar=True)
+        self.log("train_clickloss", click_loss, prog_bar=True)
+        self.log("train_KLloss", KLLoss, prog_bar=True)
         self.log("train_prior_reg", prior_reg)
+
+        # Accuracy metrics
+        self.log("train_slate_top1_acc", slate_top1_acc, prog_bar=True)
+        self.log("train_slate_top5_acc", slate_top5_acc)
+        self.log("train_click_acc", click_acc, prog_bar=True)
+
+        # Latent space metrics
+        self.log("train_latent_mu_norm", latent_mu_norm)
+        self.log("train_latent_var_mean", latent_var_mean)
+
         return loss
 
     def validation_step(self, batch, batch_idx) -> torch.FloatTensor:
@@ -280,11 +309,39 @@ class AbstractGeMS(Ranker):
 
         loss = slate_loss + self.lambda_click * click_loss + self.lambda_KL * KLLoss # + self.lambda_prior * prior_reg
 
-        self.log("val_loss", loss)
-        self.log("val_slateloss", slate_loss)
-        self.log("val_clickloss", click_loss)
-        self.log("val_KLloss", KLLoss)
+        ### 7 - Compute accuracy metrics
+        # Slate reconstruction accuracy (Top-1 and Top-5)
+        slate_preds = item_logits.argmax(dim=-1)
+        slate_top1_acc = (slate_preds == slates.flatten()).float().mean()
+
+        # Top-5 accuracy
+        _, slate_top5_preds = item_logits.topk(5, dim=-1)
+        slate_top5_acc = (slate_top5_preds == slates.flatten().unsqueeze(-1)).any(dim=-1).float().mean()
+
+        # Click prediction accuracy
+        click_preds = (torch.sigmoid(click_logits) > 0.5).float()
+        click_acc = (click_preds == clicks.flatten(end_dim=-2)).float().mean()
+
+        ### 8 - Latent space statistics
+        latent_mu_norm = latent_mu.norm(dim=-1).mean()
+        latent_var_mean = latent_var.mean()
+
+        ### 9 - Log all metrics
+        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_slateloss", slate_loss, prog_bar=True)
+        self.log("val_clickloss", click_loss, prog_bar=True)
+        self.log("val_KLloss", KLLoss, prog_bar=True)
         self.log("val_prior_reg", prior_reg)
+
+        # Accuracy metrics
+        self.log("val_slate_top1_acc", slate_top1_acc, prog_bar=True)
+        self.log("val_slate_top5_acc", slate_top5_acc)
+        self.log("val_click_acc", click_acc, prog_bar=True)
+
+        # Latent space metrics
+        self.log("val_latent_mu_norm", latent_mu_norm)
+        self.log("val_latent_var_mean", latent_var_mean)
+
         return loss
 
     # def encode(self, obs : Dict) -> torch.FloatTensor:
@@ -381,6 +438,15 @@ class GeMS(AbstractGeMS):
         click_logits = self.click_decoder(reconstruction)   # batch_size, rec_size
 
         return item_logits, click_logits
+
+    def decode_to_slate_logits(self, latent_sample):
+        """将latent action解码为slate logits"""
+        batch_size = latent_sample.size(0)
+        reconstruction = self.decoder(latent_sample)
+        slate_embeddings = self.slate_decoder(reconstruction).reshape(
+            batch_size * self.rec_size, self.item_embedd_dim)
+        item_logits = slate_embeddings @ self.item_embeddings.weight.t()
+        return item_logits.reshape(batch_size, self.rec_size, self.num_items)
 
     def run_prior(self) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         return torch.zeros(self.latent_dim, device = self.device), torch.zeros(self.latent_dim, device = self.device)

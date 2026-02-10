@@ -17,7 +17,15 @@ class BaseOfflineConfig:
     # 实验配置
     # ============================================================================
     experiment_name: str = "baseline_experiment"  # 实验名称
-    env_name: str = "diffuse_mix"  # 环境名称
+
+    # 环境名称 - 必须与数据集的环境参数匹配！
+    # 可选值:
+    #   - diffuse_mix_bt3_dp5: boredom=3, penalty=5.0 (对应 mix_divpen_v2_data_d4rl.npz)
+    #   - diffuse_mix_bt5_dp5: boredom=5, penalty=5.0 (对应 mix_divpen_v2_b5_data_d4rl.npz)
+    #   - diffuse_topdown_bt3_dp5: boredom=3, penalty=5.0 (对应 topdown_divpen_v2_data_d4rl.npz)
+    #   - diffuse_topdown_bt5_dp5: boredom=5, penalty=5.0 (对应 topdown_divpen_v2_b5_data_d4rl.npz)
+    env_name: str = "diffuse_mix_bt5_dp5"  # 默认使用 b5 环境
+
     dataset_quality: str = "expert"  # 数据集质量: random, medium, expert
     seed: int = 58407201  # 随机种子
     device: str = "cuda"  # 设备
@@ -104,6 +112,12 @@ class TD3BCConfig(BaseOfflineConfig):
     # 网络配置
     actor_lr: float = 3e-4  # Actor学习率
     critic_lr: float = 3e-4  # Critic学习率
+
+    # GRU架构配置
+    use_shared_gru: bool = True  # 使用共享GRU（推荐）
+
+    # GeMS配置（2026-01-30新增）
+    gems_embedding_mode: str = "mf_fixed"  # GeMS embedding模式: 'default', 'mf_fixed', 'mf_scratch', 'epsilon-greedy'
 
 
 @dataclass
@@ -196,6 +210,7 @@ def auto_generate_paths(config: BaseOfflineConfig, timestamp: str) -> BaseOfflin
     """
     from datetime import datetime
     from config import paths
+    from common.offline.checkpoint_utils import resolve_dataset_path
 
     # 0. 确保 run_id 存在
     if not config.run_id:
@@ -215,9 +230,10 @@ def auto_generate_paths(config: BaseOfflineConfig, timestamp: str) -> BaseOfflin
 
     # 3. 生成数据集路径
     if not config.dataset_path:
-        dataset_filename = f"{config.dataset_quality}_data_d4rl.npz"
-        config.dataset_path = str(
-            paths.get_offline_dataset_path(config.env_name, dataset_filename)
+        # 使用统一函数解析数据集路径
+        config.dataset_path = resolve_dataset_path(
+            env_name=config.env_name,
+            dataset_quality=config.dataset_quality
         )
 
     # 4. 生成物品嵌入路径 (根据环境名称自动推断)

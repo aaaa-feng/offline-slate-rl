@@ -76,3 +76,9 @@ document/
 data/data_analysis/
 experiments/
 src/data_collection/offline_data_collection/model_tests/
+
+# Test data files (too large for git)
+data/test_data/
+test/datacollecttest/
+*.pkl
+*.npz

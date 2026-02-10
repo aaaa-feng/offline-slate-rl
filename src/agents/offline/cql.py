@@ -32,6 +32,7 @@ from common.offline.buffer import TrajectoryReplayBuffer
 from common.offline.utils import set_seed, soft_update
 from common.offline.networks import TanhGaussianActor, Critic
 from common.offline.eval_env import OfflineEvalEnv
+from common.offline.checkpoint_utils import resolve_gems_checkpoint
 from belief_encoders.gru_belief import GRUBelief
 from rankers.gems.item_embeddings import ItemEmbeddings
 from rankers.gems.rankers import GeMS
@@ -53,6 +54,7 @@ class CQLAgent:
         action_dim: int,
         config: CQLConfig,
         ranker_params: Dict,  # 🔥 GeMS-aligned
+        ranker=None,  # 🔥 Solution B: Accept ranker for real-time inference
     ):
         self.config = config
         self.device = torch.device(config.device)
@@ -63,6 +65,9 @@ class CQLAgent:
         # ========================================================================
         # 🔥 从 Ranker 参数中提取组件
         # ========================================================================
+
+        # 0. Ranker for real-time action inference (Solution B)
+        self.ranker = ranker
 
         # 1. Action Bounds
         self.action_center = ranker_params['action_center'].to(self.device)
@@ -139,8 +144,14 @@ class CQLAgent:
         s_critic = states["critic"]
         ns_critic = next_states["critic"]
 
-        # Step 2: Concatenate data
-        true_actions = torch.cat(batch.actions, dim=0)
+        # Step 2: Real-time action inference (Solution B)
+        flat_slates = torch.cat(batch.obs["slate"], dim=0)
+        flat_clicks = torch.cat(batch.obs["clicks"], dim=0)
+
+        with torch.no_grad():
+            true_actions, _ = self.ranker.run_inference(flat_slates, flat_clicks)
+            true_actions = (true_actions - self.action_center) / self.action_scale
+
         rewards = torch.cat(batch.rewards, dim=0) if batch.rewards else None
         dones = torch.cat(batch.dones, dim=0) if batch.dones else None
 
@@ -158,12 +169,16 @@ class CQLAgent:
                 target_q = target_q * self.config.gamma
 
             # 🔧 HOT-FIX: Target Q Clamping (防止Q值爆炸)
-            # 由于reward已经缩放到 [-1, 1] 范围,Q值应该在 [-10, 10] 范围内
-            target_q = torch.clamp(target_q, -10.0, 10.0)
+            # 理论Q_max=63.4, CQL需要更大范围(100.0)支持保守惩罚机制
+            target_q = torch.clamp(target_q, -10.0, 100.0)
 
         # Current Q values (detach s_critic to avoid gradient conflict)
         current_q1 = self.critic_1.q1(s_critic.detach(), true_actions)
         current_q2 = self.critic_2.q1(s_critic.detach(), true_actions)
+        # 🔧 NUMERICAL STABILITY FIX: Clamp current Q-values to prevent explosion
+        # CQL需要更大范围(100.0)支持保守惩罚机制，统一下界为-10.0
+        current_q1 = torch.clamp(current_q1, -10.0, 100.0)
+        current_q2 = torch.clamp(current_q2, -10.0, 100.0)
 
         # Bellman error
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
@@ -175,6 +190,9 @@ class CQLAgent:
         # Q values for random actions (detach s_critic to avoid gradient conflict)
         random_q1 = self.critic_1.q1(s_critic.detach(), random_actions)
         random_q2 = self.critic_2.q1(s_critic.detach(), random_actions)
+        # 🔧 NUMERICAL STABILITY FIX: Clamp random Q-values to prevent explosion
+        random_q1 = torch.clamp(random_q1, -10.0, 100.0)
+        random_q2 = torch.clamp(random_q2, -10.0, 100.0)
 
         # CQL loss
         cql_loss = (random_q1.mean() + random_q2.mean() - current_q1.mean() - current_q2.mean())
@@ -185,8 +203,10 @@ class CQLAgent:
         total_critic_loss.backward()
         # 🔧 HOT-FIX: Critic Gradient Clipping (防止梯度爆炸)
         critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(self.critic_1.parameters()) + list(self.critic_2.parameters()),
-            10.0  # 从 float('inf') 改为 10.0
+            list(self.belief.gru["critic"].parameters()) +
+            list(self.critic_1.parameters()) +
+            list(self.critic_2.parameters()),
+            10.0
         )
         self.critic_optimizer.step()
 
@@ -204,7 +224,10 @@ class CQLAgent:
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         # 🔧 HOT-FIX: Actor Gradient Clipping (防止梯度爆炸)
-        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100.0)  # 从 float('inf') 改为 100.0
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+            list(self.belief.gru["actor"].parameters()) + list(self.actor.parameters()),
+            10.0
+        )
         self.actor_optimizer.step()
 
         # Update target networks
@@ -408,7 +431,8 @@ def train_cql(config: CQLConfig):
     logging.info(f"Dataset statistics:")
     logging.info(f"  Slates shape: {dataset['slates'].shape}")
     logging.info(f"  Clicks shape: {dataset['clicks'].shape}")
-    logging.info(f"  Actions shape: {dataset['actions'].shape}")
+    logging.info(f"  Next slates shape: {dataset['next_slates'].shape}")
+    logging.info(f"  Next clicks shape: {dataset['next_clicks'].shape}")
     logging.info(f"  Total transitions: {len(dataset['slates'])}")
 
     # ========================================================================
@@ -418,9 +442,13 @@ def train_cql(config: CQLConfig):
     logging.info("Loading GeMS checkpoint")
     logging.info(f"{'='*80}")
 
-    gems_checkpoint_name = f"GeMS_{config.env_name}_{config.dataset_quality}_latent32_beta1.0_click0.5_seed58407201"
-    gems_path = f"/data/liyuefeng/offline-slate-rl/checkpoints/gems/offline/{gems_checkpoint_name}.ckpt"
+    # 使用统一配置模块解析checkpoint路径和参数
+    gems_path, lambda_click = resolve_gems_checkpoint(
+        env_name=config.env_name,
+        dataset_quality=config.dataset_quality
+    )
     logging.info(f"GeMS checkpoint: {gems_path}")
+    logging.info(f"Lambda click: {lambda_click}")
 
     # Load temporary embeddings for GeMS initialization
     temp_embeddings = ItemEmbeddings.from_pretrained(config.item_embedds_path, config.device)
@@ -435,7 +463,7 @@ def train_cql(config: CQLConfig):
         device=config.device,
         rec_size=config.rec_size,
         latent_dim=32,
-        lambda_click=0.5,
+        lambda_click=lambda_click,
         lambda_KL=1.0,
         lambda_prior=1.0,
         ranker_lr=3e-3,
@@ -452,85 +480,32 @@ def train_cql(config: CQLConfig):
     logging.info(f"✅ GeMS moved to {config.device}")
 
     # ========================================================================
-    # 内存重打标 (In-Memory Action Relabeling) - Zero Trust Strategy
+    # 🔥 Solution B: Real-time Action Inference (No Pre-computed Actions)
     # ========================================================================
     logging.info("")
     logging.info("=" * 80)
-    logging.info("⚠️  IN-MEMORY ACTION RELABELING")
+    logging.info("✅ Using Real-time Action Inference (Solution B)")
     logging.info("=" * 80)
-    logging.info("Strategy: Zero Trust - Regenerate all actions using current GeMS")
-    logging.info("Reason:   Ensure absolute consistency between training and inference")
-
-    # 1. Extract raw discrete data
-    raw_slates = torch.tensor(dataset['slates'], device=config.device, dtype=torch.long)
-    raw_clicks = torch.tensor(dataset['clicks'], device=config.device, dtype=torch.float)
-    total_samples = len(raw_slates)
-
-    # 2. Batch inference to regenerate actions
-    batch_size = 1000
-    new_actions_list = []
-
-    with torch.no_grad():
-        for i in range(0, total_samples, batch_size):
-            batch_slates = raw_slates[i:i+batch_size]
-            batch_clicks = raw_clicks[i:i+batch_size]
-
-            # Key: Use current GeMS Encoder to infer latent actions
-            mu, _ = ranker.run_inference(batch_slates, batch_clicks)
-            new_actions_list.append(mu.cpu().numpy())
-
-            if (i + batch_size) % 100000 == 0 or (i + batch_size) >= total_samples:
-                processed = min(i + batch_size, total_samples)
-                logging.info(f"  Progress: {processed:,}/{total_samples:,}")
-
-    new_actions = np.concatenate(new_actions_list, axis=0)
-
-    # 3. Action statistics validation
-    logging.info("Action Statistics (Primary Quality Indicator):")
-    logging.info(f"  Mean:  {new_actions.mean():.6f} (expect ≈ 0)")
-    logging.info(f"  Std:   {new_actions.std():.6f}  (expect ≈ 1)")
-    logging.info(f"  Min:   {new_actions.min():.6f}")
-    logging.info(f"  Max:   {new_actions.max():.6f}")
-
-    # 4. GeMS reconstruction quality test (Informational only, no blocking)
-    logging.info("")
-    logging.info("GeMS Reconstruction Quality Test (Informational Only):")
-    test_size = min(100, len(raw_slates))
-    test_slates = raw_slates[:test_size]
-    test_clicks = raw_clicks[:test_size]
-    with torch.no_grad():
-        test_actions, _ = ranker.run_inference(test_slates, test_clicks)
-        # Loop decoding (ranker.rank does not support batch input)
-        matches_list = []
-        for i in range(test_size):
-            reconstructed = ranker.rank(test_actions[i])
-            match = (test_slates[i] == reconstructed).float().mean().item()
-            matches_list.append(match)
-        matches = np.mean(matches_list)
-    logging.info(f"  Exact match accuracy: {matches:.4f}")
-    logging.info("  Note: Low accuracy is normal for slate ranking tasks")
-
-    # 5. Overwrite old actions
-    logging.info("")
-    logging.info("✅ Action relabeling complete. Overwriting dataset actions.")
+    logging.info("Strategy: Infer actions on-the-fly during training from slates/clicks")
+    logging.info("Benefits: No preprocessing overhead, supports ranker fine-tuning")
     logging.info("=" * 80)
     logging.info("")
 
-    # Get dimensions
-    action_dim = dataset['actions'].shape[1]
+    # Get action dimension from ranker
+    action_dim = ranker.latent_dim
 
     # Create buffer
     replay_buffer = TrajectoryReplayBuffer(device=config.device)
-    # 6. Load data with relabeled actions
+    # Load data (V4 format - no pre-computed actions)
     dataset_dict = {
         'episode_ids': dataset['episode_ids'],
         'slates': dataset['slates'],
         'clicks': dataset['clicks'],
-        'actions': new_actions,  # Use relabeled actions!
+        'next_slates': dataset['next_slates'],  # ✅ Required by TrajectoryReplayBuffer
+        'next_clicks': dataset['next_clicks'],  # ✅ Required by TrajectoryReplayBuffer
     }
     if 'rewards' in dataset:
         if config.normalize_rewards:
-            # Apply scaling / 100.0 as standard practice
             dataset_dict['rewards'] = dataset['rewards'] / 100.0
             logging.info("⚡ Applied reward scaling: rewards / 100.0")
         else:
@@ -539,7 +514,31 @@ def train_cql(config: CQLConfig):
         dataset_dict['terminals'] = dataset['terminals']
 
     replay_buffer.load_d4rl_dataset(dataset_dict)
-    action_center, action_scale = replay_buffer.get_action_normalization_params()
+    logging.info(f"✅ Buffer loaded successfully")
+
+    # ========================================================================
+    # 🔥 Compute Action Normalization (TD3+BC approach)
+    # ========================================================================
+    logging.info("")
+    logging.info("Computing action normalization parameters...")
+
+    sample_size = min(10000, len(dataset['slates']))
+    sample_indices = np.random.choice(len(dataset['slates']), sample_size, replace=False)
+    sample_slates = torch.tensor(dataset['slates'][sample_indices], device=config.device, dtype=torch.long)
+    sample_clicks = torch.tensor(dataset['clicks'][sample_indices], device=config.device, dtype=torch.float)
+
+    with torch.no_grad():
+        sample_actions, _ = ranker.run_inference(sample_slates, sample_clicks)
+
+    action_min = sample_actions.min(dim=0)[0]
+    action_max = sample_actions.max(dim=0)[0]
+    action_center = (action_max + action_min) / 2
+    action_scale = (action_max - action_min) / 2 + 1e-6
+
+    logging.info(f"✅ Action normalization computed from {sample_size} samples")
+    logging.info(f"  center mean: {action_center.mean().item():.6f}")
+    logging.info(f"  scale mean: {action_scale.mean().item():.6f}")
+    logging.info("")
 
     # Extract GeMS-trained embeddings (GeMS already loaded before relabeling)
     logging.info(f"\n{'='*80}")
@@ -575,6 +574,7 @@ def train_cql(config: CQLConfig):
         action_dim=action_dim,
         config=config,
         ranker_params=ranker_params,
+        ranker=ranker,  # 🔥 Solution B: Pass ranker for real-time inference
     )
 
     # Initialize evaluation environment
@@ -721,8 +721,7 @@ if __name__ == "__main__":
     parser.add_argument("--env_name", type=str, default="diffuse_mix",
                         help="环境名称")
     parser.add_argument("--dataset_quality", type=str, default="expert",
-                        choices=["random", "medium", "expert"],
-                        help="数据集质量")
+                        help="数据集质量 (旧benchmark: random/medium/expert, 新benchmark: v2_b3/v2_b5)")
     parser.add_argument("--seed", type=int, default=58407201,
                         help="随机种子")
     parser.add_argument("--run_id", type=str, default="",

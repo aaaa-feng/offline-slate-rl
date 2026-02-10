@@ -59,13 +59,42 @@ class EnvironmentFactory:
 
         # 环境配置映射
         # 注意：divpen环境使用diversity_penalty=3.0，其他环境使用1.0
+        # 🔥 修复：明确指定每个环境的 click_model
         self.env_configs = {
-            'diffuse_topdown': {**base_config, 'dataset_name': 'diffuse_topdown'},
-            'diffuse_mix': {**base_config, 'dataset_name': 'diffuse_mix'},
-            'diffuse_divpen': {**base_config, 'dataset_name': 'diffuse_divpen', 'diversity_penalty': 3.0},
-            'focused_topdown': {**focused_base_config, 'dataset_name': 'focused_topdown', 'diversity_penalty': 1.0},
-            'focused_mix': {**focused_base_config, 'dataset_name': 'focused_mix', 'diversity_penalty': 1.0},
-            'focused_divpen': {**focused_base_config, 'dataset_name': 'focused_divpen', 'diversity_penalty': 3.0}
+            'diffuse_topdown': {
+                **base_config,
+                'dataset_name': 'diffuse_topdown',
+                'click_model': 'tdPBM'  # TopDown 使用 tdPBM
+            },
+            'diffuse_mix': {
+                **base_config,
+                'dataset_name': 'diffuse_mix',
+                'click_model': 'mixPBM'  # 🔥 修复：Mix 应该使用 mixPBM
+            },
+            'diffuse_divpen': {
+                **base_config,
+                'dataset_name': 'diffuse_divpen',
+                'click_model': 'mixPBM',  # 🔥 修复：Divpen 应该使用 mixPBM
+                'diversity_penalty': 3.0
+            },
+            'focused_topdown': {
+                **focused_base_config,
+                'dataset_name': 'focused_topdown',
+                'click_model': 'tdPBM',  # TopDown 使用 tdPBM
+                'diversity_penalty': 1.0
+            },
+            'focused_mix': {
+                **focused_base_config,
+                'dataset_name': 'focused_mix',
+                'click_model': 'mixPBM',  # Mix 使用 mixPBM
+                'diversity_penalty': 1.0
+            },
+            'focused_divpen': {
+                **focused_base_config,
+                'dataset_name': 'focused_divpen',
+                'click_model': 'mixPBM',  # Divpen 使用 mixPBM
+                'diversity_penalty': 3.0
+            }
         }
     
     def create_environment(self, env_name: str, **kwargs) -> TopicRec:

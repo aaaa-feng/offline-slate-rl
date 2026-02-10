@@ -39,30 +39,74 @@ class ReplayBuffer:
 
     def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
         """
-        加载D4RL格式的数据集（兼容CORL接口）
+        加载D4RL格式的数据集（支持新旧两种格式）
 
-        Args:
-            data: 包含observations, actions, rewards, next_observations, terminals的字典
+        新格式（V4重构）：
+            - slates: (N, rec_size) 原始推荐slate
+            - clicks: (N, rec_size) 用户点击
+            - next_slates: (N, rec_size) 下一个slate
+            - next_clicks: (N, rec_size) 下一个点击
+            - rewards, terminals
+
+        旧格式（向后兼容）：
+            - observations: (N, state_dim) 预编码的belief state
+            - actions: (N, action_dim) 预编码的latent action
+            - next_observations: (N, state_dim)
+            - rewards, terminals
+
+        ⚠️ 语义变化：
+            新格式下，self._states 存储的是 slates（离散ID），而非预编码状态
+            新格式下，self._actions 存储的是 clicks（0/1），而非latent action
+            使用方算法需要在训练时实时编码/推断
         """
         if self._size != 0:
             raise ValueError("Trying to load data into non-empty replay buffer")
 
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                f"Replay buffer is smaller than the dataset you are trying to load! "
-                f"Buffer size: {self._buffer_size}, Dataset size: {n_transitions}"
-            )
+        # 🔥 检测数据格式
+        if 'slates' in data:
+            # ========== 新格式（V4重构）==========
+            print("🔥 检测到新格式数据集（slates + clicks）")
 
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
+            n_transitions = data["slates"].shape[0]
+            if n_transitions > self._buffer_size:
+                raise ValueError(
+                    f"Replay buffer is smaller than the dataset! "
+                    f"Buffer size: {self._buffer_size}, Dataset size: {n_transitions}"
+                )
+
+            # 存储原始 slates 和 clicks（不再是预编码的状态/动作）
+            self._states[:n_transitions] = self._to_tensor(data["slates"])
+            self._actions[:n_transitions] = self._to_tensor(data["clicks"])
+            self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
+            self._next_states[:n_transitions] = self._to_tensor(data["next_slates"])
+            # Note: next_clicks 可以选择性存储，这里暂不存储（如需要可扩展）
+            self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
+
+            print(f"✅ 新格式数据集加载成功: {n_transitions} transitions")
+            print(f"   States = slates (shape: {data['slates'].shape})")
+            print(f"   Actions = clicks (shape: {data['clicks'].shape})")
+
+        else:
+            # ========== 旧格式（向后兼容）==========
+            print("⚠️  检测到旧格式数据集（observations + actions）")
+
+            n_transitions = data["observations"].shape[0]
+            if n_transitions > self._buffer_size:
+                raise ValueError(
+                    f"Replay buffer is smaller than the dataset! "
+                    f"Buffer size: {self._buffer_size}, Dataset size: {n_transitions}"
+                )
+
+            self._states[:n_transitions] = self._to_tensor(data["observations"])
+            self._actions[:n_transitions] = self._to_tensor(data["actions"])
+            self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
+            self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
+            self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
+
+            print(f"✅ 旧格式数据集加载成功: {n_transitions} transitions")
+
         self._size += n_transitions
         self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
 
     def sample(self, batch_size: int) -> List[torch.Tensor]:
         """
@@ -163,16 +207,20 @@ class TrajectoryBatch:
     """
     Trajectory batch for RNN-based agents
 
+    🔥 V4重构：添加 next_obs，actions 改为可选
+
     Attributes:
         obs: Dict with keys 'slate' and 'clicks', each containing List[Tensor]
              - slate: List of [seq_len, rec_size] tensors
              - clicks: List of [seq_len, rec_size] tensors
-        actions: List of [seq_len, action_dim] tensors
+        next_obs: Dict with keys 'slate' and 'clicks' for next observations
+        actions: List of [seq_len, action_dim] tensors (optional, 新格式不再使用)
         rewards: List of [seq_len, 1] tensors (optional, for value-based methods)
         dones: List of [seq_len, 1] tensors (optional, for value-based methods)
     """
     obs: Dict[str, List[torch.Tensor]]
-    actions: List[torch.Tensor]
+    next_obs: Dict[str, List[torch.Tensor]] = None  # 🔥 [FIX] 添加
+    actions: List[torch.Tensor] = None  # 🔥 [FIX] 改为可选
     rewards: List[torch.Tensor] = None
     dones: List[torch.Tensor] = None
 
@@ -235,29 +283,34 @@ class TrajectoryReplayBuffer:
         """
         加载D4RL格式的数据集，按episode_ids分割成trajectories
 
+        🔥 V4重构：不再依赖预编码的 actions 字段
+        - 只加载原始数据：slates, clicks, next_slates, next_clicks
+        - 动作归一化由外部（TD3初始化时）计算
+
         Args:
             data: 包含以下字段的字典:
                 - episode_ids: (N,) episode标识
                 - slates: (N, rec_size) 推荐slate
                 - clicks: (N, rec_size) 用户点击
-                - actions: (N, action_dim) 动作（潜在向量）
+                - next_slates: (N, rec_size) 下一个slate
+                - next_clicks: (N, rec_size) 下一个点击
                 - rewards: (N,) 奖励（可选）
                 - terminals: (N,) 终止标志（可选）
         """
         if self._trajectories:
             raise ValueError("Trying to load data into non-empty replay buffer")
 
-        # 1. 归一化动作
-        print("Normalizing actions...")
-        action_center, action_scale, normalized_actions = self.normalize_actions(data)
-        self._action_center = action_center
-        self._action_scale = action_scale
+        # 🔥 [FIX] 移除动作归一化逻辑（改由外部计算）
+        # self._action_center 和 self._action_scale 将由外部传入
 
-        # 2. 转换为tensor
+        # 转换为tensor
         episode_ids = data["episode_ids"]
         slates = torch.tensor(data["slates"], dtype=torch.long, device=self._device)
-        clicks = torch.tensor(data["clicks"], dtype=torch.long, device=self._device)
-        actions = normalized_actions  # 已经是tensor
+        clicks = torch.tensor(data["clicks"], dtype=torch.float32, device=self._device)
+
+        # 🔥 [FIX] 读取 next_slates 和 next_clicks
+        next_slates = torch.tensor(data["next_slates"], dtype=torch.long, device=self._device)
+        next_clicks = torch.tensor(data["next_clicks"], dtype=torch.float32, device=self._device)
 
         # 可选字段
         if "rewards" in data:
@@ -270,7 +323,7 @@ class TrajectoryReplayBuffer:
         else:
             dones = None
 
-        # 3. 按episode_ids分割成trajectories
+        # 按episode_ids分割成trajectories
         print("Splitting into trajectories...")
         unique_episode_ids = np.unique(episode_ids)
         self._num_episodes = len(unique_episode_ids)
@@ -283,12 +336,16 @@ class TrajectoryReplayBuffer:
             # 提取当前episode的数据
             ep_slates = slates[indices]
             ep_clicks = clicks[indices]
-            ep_actions = actions[indices]
+            # 🔥 [FIX] 提取 next_slates 和 next_clicks
+            ep_next_slates = next_slates[indices]
+            ep_next_clicks = next_clicks[indices]
 
             trajectory = {
                 "slate": ep_slates,
                 "clicks": ep_clicks,
-                "action": ep_actions,
+                "next_slate": ep_next_slates,  # 🔥 [FIX] 添加
+                "next_clicks": ep_next_clicks,  # 🔥 [FIX] 添加
+                # "action": ep_actions,  # 🔥 [FIX] 删除，数据集中没有 action 了
             }
 
             if rewards is not None:
@@ -306,13 +363,15 @@ class TrajectoryReplayBuffer:
         """
         采样一个batch的trajectories
 
+        🔥 V4重构：返回 next_slate 和 next_clicks，不再返回 actions
+
         Args:
             batch_size: 要采样的episode数量
 
         Returns:
             TrajectoryBatch对象，包含:
                 - obs: Dict with 'slate' and 'clicks' as List[Tensor]
-                - actions: List[Tensor]
+                - next_obs: Dict with 'next_slate' and 'next_clicks' as List[Tensor]
                 - rewards: List[Tensor] (if available)
                 - dones: List[Tensor] (if available)
         """
@@ -322,7 +381,8 @@ class TrajectoryReplayBuffer:
         # 收集数据
         slates_list = []
         clicks_list = []
-        actions_list = []
+        next_slates_list = []  # 🔥 [FIX] 添加
+        next_clicks_list = []  # 🔥 [FIX] 添加
         rewards_list = []
         dones_list = []
 
@@ -330,7 +390,12 @@ class TrajectoryReplayBuffer:
             traj = self._trajectories[idx]
             slates_list.append(traj["slate"])
             clicks_list.append(traj["clicks"])
-            actions_list.append(traj["action"])
+
+            # 🔥 [FIX] 收集 next 数据
+            next_slates_list.append(traj["next_slate"])
+            next_clicks_list.append(traj["next_clicks"])
+
+            # actions_list.append(traj["action"])  # 🔥 [FIX] 删除
 
             if "reward" in traj:
                 rewards_list.append(traj["reward"].unsqueeze(-1))  # [seq_len, 1]
@@ -343,9 +408,16 @@ class TrajectoryReplayBuffer:
             "clicks": clicks_list,
         }
 
+        # 🔥 [FIX] 构造 next_obs
+        next_obs = {
+            "slate": next_slates_list,
+            "clicks": next_clicks_list,
+        }
+
         batch = TrajectoryBatch(
             obs=obs,
-            actions=actions_list,
+            next_obs=next_obs,  # 🔥 [FIX] 添加 next_obs
+            actions=None,  # 🔥 [FIX] 不再返回 actions
             rewards=rewards_list if rewards_list else None,
             dones=dones_list if dones_list else None,
         )

@@ -13,7 +13,7 @@
 import sys
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 import numpy as np
 import torch
@@ -25,6 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT.parent))
 
 from config import paths
 from config.env_params import get_env_config
+from common.offline.checkpoint_utils import resolve_gems_checkpoint, extract_boredom_threshold
 
 # 导入在线RL组件
 from common.online.data_module import BufferDataModule
@@ -47,7 +48,9 @@ class OfflineEvalEnv:
         dataset_quality: str = "medium",
         device: str = "cuda",
         seed: int = 58407201,
-        verbose: bool = True
+        verbose: bool = True,
+        env_param_override: Optional[Dict[str, Any]] = None,
+        ranker = None  # 🔥 可选：从Agent传入的ranker（包含完整的GeMS模型）
     ):
         """
         初始化离线评估环境
@@ -58,15 +61,29 @@ class OfflineEvalEnv:
             device: 设备
             seed: 随机种子
             verbose: 是否打印详细信息
+            env_param_override: 环境参数覆盖字典 (用于测试不同环境配置)
+            ranker: 可选的ranker实例（如果提供，则不会单独加载GeMS）
         """
         self.env_name = env_name
         self.dataset_quality = dataset_quality
         self.device = device
         self.seed = seed
         self.verbose = verbose
+        self.env_param_override = env_param_override
 
-        # 加载环境配置
-        self.env_config = get_env_config(env_name)
+        # 加载环境配置（传递 dataset_quality 以加载正确的元数据文件）
+        self.env_config = get_env_config(env_name, dataset_quality)
+
+        # 🔥 对于新 benchmark，从 dataset_quality 中自动提取 boredom threshold
+        if self.env_name in ['mix_divpen', 'topdown_divpen']:
+            boredom = extract_boredom_threshold(self.dataset_quality, self.env_name)
+            if boredom is not None:
+                # 初始化 env_param_override（如果用户没有提供）
+                if self.env_param_override is None:
+                    self.env_param_override = {}
+                # 只在用户没有显式设置时才覆盖
+                if 'boredom_threshold' not in self.env_param_override:
+                    self.env_param_override['boredom_threshold'] = boredom
 
         if self.verbose:
             logging.info(f"Initializing OfflineEvalEnv for {env_name}")
@@ -74,9 +91,17 @@ class OfflineEvalEnv:
             logging.info(f"  Diversity penalty: {self.env_config['diversity_penalty']}")
             logging.info(f"  Ranker dataset: {self.env_config['ranker_dataset']}")
 
+        # 🔥 DEPRECATED: Ranker参数已废弃，agents现在内部处理slate解码
+        if ranker is not None:
+            logging.warning(
+                "⚠️  OfflineEvalEnv no longer requires ranker parameter. "
+                "Agents now handle slate decoding internally."
+            )
+            logging.warning("    This parameter will be removed in future versions.")
+
         # 初始化组件
         self.env = None
-        self.ranker = None
+        self.ranker = None  # 🔥 不再使用ranker（agents现在输出slate）
         self.item_embeddings = None
         self.ranker_checkpoint_path = None  # 用于日志输出
 
@@ -86,29 +111,30 @@ class OfflineEvalEnv:
         # 加载Item Embeddings
         self._load_item_embeddings()
 
-        # 加载Ranker
-        self._load_ranker()
+        # 🔥 DEPRECATED: 不再加载ranker（agents现在内部处理slate解码）
+        # 保留此逻辑仅用于向后兼容，但实际不再使用
+        self.ranker_checkpoint_path = "deprecated"
 
         # 强制打印参数摘要 (无视 verbose 设置,确保可观测性)
-        logging.info("")
-        logging.info("=" * 70)
-        logging.info("Offline Evaluation Environment Setup")
-        logging.info("=" * 70)
-        logging.info(f"Env Name:            {self.env_name}")
-        logging.info(f"Dataset Quality:     {self.dataset_quality}")
-        logging.info(f"Click Model:         {self.env_config['click_model']}")
-        logging.info(f"Diversity Penalty:   {self.env_config['diversity_penalty']}")
-        logging.info(f"Episode Length:      {self.env_config['episode_length']}")
-        logging.info(f"Boredom Threshold:   {self.env_config['boredom_threshold']}")
-        logging.info(f"Ranker Source:       {self.ranker_checkpoint_path}")
-        logging.info("=" * 70)
-        logging.info("✅ OfflineEvalEnv initialization completed (GeMS-only E2E mode)")
-        logging.info("")
+        logging.info(f"[eval_env.py] Eval env: {self.env_name}/{self.dataset_quality}, click_model={self.env_config['click_model']}, ep_len={self.env_config['episode_length']}")
 
     def _create_environment(self):
         """创建环境 (使用与数据收集一致的参数)"""
         if self.verbose:
             logging.info("Creating environment...")
+
+        # 🔥 应用环境参数覆盖 (用于测试不同配置)
+        if self.env_param_override:
+            if self.verbose:
+                logging.info("⚠️  Applying environment parameter overrides:")
+            for key, value in self.env_param_override.items():
+                if key in self.env_config:
+                    old_value = self.env_config[key]
+                    self.env_config[key] = value
+                    if self.verbose:
+                        logging.info(f"  {key}: {old_value} → {value}")
+                else:
+                    logging.warning(f"  Unknown parameter: {key}")
 
         # 创建空的buffer (评估时不需要)
         buffer = BufferDataModule(
@@ -187,56 +213,16 @@ class OfflineEvalEnv:
             logging.warning(f"  Embeddings file not found: {embeddings_path}")
 
     def _load_ranker(self):
-        """加载Ranker (GeMS VAE) - 直接从纯GeMS checkpoint加载"""
-        if self.verbose:
-            logging.info("Loading Ranker (GeMS)...")
+        """
+        [DEPRECATED] Agents现在内部处理slate解码
 
-        # 构建GeMS checkpoint路径
-        project_root = PROJECT_ROOT.parent
-        gems_ckpt_dir = project_root / "checkpoints" / "gems" / "offline"
-
-        # 根据环境名称和数据集质量构建checkpoint文件名
-        # 格式: GeMS_{env_name}_{quality}_latent32_beta1.0_click0.5_seed58407201.ckpt
-        dataset_name = self.env_config["dataset_name"]
-        gems_ckpt_name = f"GeMS_{dataset_name}_{self.dataset_quality}_latent32_beta1.0_click0.5_seed58407201.ckpt"
-        gems_ckpt_path = gems_ckpt_dir / gems_ckpt_name
-
-        if not gems_ckpt_path.exists():
-            raise FileNotFoundError(f"GeMS checkpoint not found: {gems_ckpt_path}")
-
-        # 保存路径用于日志输出
-        self.ranker_checkpoint_path = str(gems_ckpt_path)
-
-        if self.verbose:
-            logging.info(f"  Loading Ranker from: {gems_ckpt_path}")
-
-        # 使用GeMS.load_from_checkpoint标准方法加载
-        self.ranker = GeMS.load_from_checkpoint(
-            str(gems_ckpt_path),
-            map_location=self.device,
-            item_embeddings=self.item_embeddings,
-            item_embedd_dim=self.env_config["item_embedd_dim"],
-            device=self.device,
-            rec_size=10,
-            latent_dim=self.env_config["latent_dim"],
-            lambda_click=0.5,
-            lambda_KL=1.0,
-            lambda_prior=1.0,
-            ranker_lr=3e-3,
-            fixed_embedds="scratch",
-            ranker_sample=False,
-            hidden_layers_infer=[512, 256],
-            hidden_layers_decoder=[256, 512]
+        此方法保留用于向后兼容，但不再执行任何操作。
+        """
+        logging.warning(
+            "⚠️  _load_ranker() is deprecated. "
+            "Slate decoding is now handled by agents."
         )
-
-        self.ranker.eval()
-        self.ranker.freeze()
-
-        # 显式强制设备同步 (不依赖 load_from_checkpoint 的自动管理)
-        self.ranker = self.ranker.to(self.device)
-
-        if self.verbose:
-            logging.info(f"  ✅ GeMS Ranker loaded successfully")
+        return None
 
     def evaluate_policy(
         self,
@@ -274,19 +260,12 @@ class OfflineEvalEnv:
                 agent.reset_hidden()
 
             while not done:
-                # 端到端模式: Agent直接处理原始obs并输出latent_action
-                latent_action = agent.act(obs, deterministic=deterministic)
+                # 🔥 SIMPLIFIED: Agent现在直接输出slate (不再输出latent_action)
+                slate = agent.act(obs, deterministic=deterministic)
 
-                # 将latent_action转为tensor给Ranker (添加batch维度)
-                latent_action_tensor = torch.FloatTensor(latent_action).unsqueeze(0).to(self.device)
-
-                # 防御性检查: 确保 tensor 确实在正确的设备上
-                if latent_action_tensor.device != self.ranker.device:
-                    latent_action_tensor = latent_action_tensor.to(self.ranker.device)
-
-                # Ranker解码为slate
-                with torch.no_grad():
-                    slate = self.ranker.rank(latent_action_tensor).squeeze(0)
+                # 转换为tensor (如果agent返回numpy array)
+                if isinstance(slate, np.ndarray):
+                    slate = torch.from_numpy(slate).long().to(self.device)
 
                 # 环境执行
                 obs, reward, done, info = self.env.step(slate)

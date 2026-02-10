@@ -100,148 +100,175 @@ class SlateDataset:
         }
     
     def to_d4rl_format(self) -> Dict[str, np.ndarray]:
-        """转换为D4RL标准格式"""
+        """
+        转换为D4RL标准格式（V4重构版）
+
+        🔥 重大变更：移除预编码的 observations 和 actions 字段
+        - 不再保存 belief_state（预编码的观察）
+        - 不再保存 latent_action（预编码的动作）
+        - 只保存原始数据：slates + clicks + rewards + terminals
+        - 训练时动态推断 latent_action 并计算归一化参数
+        """
         if not self.trajectories:
             return {}
-        
+
         # 收集所有转移
         all_transitions = []
         for traj in self.trajectories:
             all_transitions.extend(traj.transitions)
-        
+
         if not all_transitions:
             return {}
-        
-        # 提取数据
-        observations = []
-        actions = []
+
+        # 🔥 V4重构：只提取核心数据
         rewards = []
-        next_observations = []
         terminals = []
         timeouts = []
-        
-        # Slate推荐特有字段
+
+        # Slate推荐核心字段
         slates = []
         clicks = []
+        next_slates = []  # 🔥 [FIX] 添加 next_slates
+        next_clicks = []  # 🔥 [FIX] 添加 next_clicks
         diversity_scores = []
         coverage_scores = []
         episode_ids = []
         timesteps = []
 
-        # V2新增字段（向后兼容）
-        raw_observations = []
-        raw_next_observations = []
+        # Oracle信息（用于分析，不用于训练）
         user_states = []
         user_bored = []
-        item_relevances = []  # V3新增：Oracle信息
+        item_relevances = []
 
         for i, transition in enumerate(all_transitions):
-            # 标准D4RL字段
+            # 🔥 V4重构：只提取核心数据
             obs = transition.observation
             next_obs = transition.next_observation
-            
-            # 使用belief_state作为主要观察
-            if obs.belief_state is not None:
-                observations.append(obs.belief_state.cpu().numpy())
-            else:
-                # 如果没有belief_state，使用零向量占位
-                observations.append(np.zeros(32))  # 假设belief_state_dim=32
-            
-            if next_obs.belief_state is not None:
-                next_observations.append(next_obs.belief_state.cpu().numpy())
-            else:
-                next_observations.append(np.zeros(32))
-            
-            # 动作优先使用latent_action（连续动作），如果没有则使用slate（离散动作）
-            if transition.action.latent_action is not None:
-                # 使用连续latent action（用于TD3+BC等离线RL算法）
-                actions.append(transition.action.latent_action.cpu().numpy())
-            else:
-                # 降级方案：使用离散slate（用于random数据或没有ranker的情况）
-                slate_array = np.array(transition.action.discrete_slate)
-                actions.append(slate_array)
-            
+
+            # 核心训练数据
             rewards.append(transition.reward)
             terminals.append(transition.done)
-            timeouts.append(False)  # 假设没有timeout
-            
-            # Slate推荐特有字段
+            timeouts.append(False)
+
+            # Slate推荐核心字段
             slates.append(transition.action.discrete_slate)
             clicks.append(transition.info.clicks.cpu().numpy())
+
+            # 🔥 [FIX] 收集 next_slate 和 next_clicks
+            # 从 next_observation 中提取（如果有 raw_obs）
+            if next_obs.raw_obs is not None and 'slate' in next_obs.raw_obs:
+                # 处理 slate：如果是 tensor 则转换为 list
+                slate_value = next_obs.raw_obs['slate']
+                if torch.is_tensor(slate_value):
+                    next_slates.append(slate_value.cpu().tolist())
+                else:
+                    next_slates.append(slate_value)
+                # 处理 clicks
+                next_clicks.append(next_obs.raw_obs['clicks'].cpu().numpy() if torch.is_tensor(next_obs.raw_obs['clicks']) else next_obs.raw_obs['clicks'])
+            else:
+                # 降级方案：使用当前 transition 的下一个 transition 的 slate
+                # 或者使用空值（episode 结束时）
+                if i + 1 < len(all_transitions):
+                    next_slates.append(all_transitions[i + 1].action.discrete_slate)
+                    next_clicks.append(all_transitions[i + 1].info.clicks.cpu().numpy())
+                else:
+                    # Episode 结束，使用当前 slate 作为占位
+                    next_slates.append(transition.action.discrete_slate)
+                    next_clicks.append(transition.info.clicks.cpu().numpy())
+
             diversity_scores.append(transition.info.diversity_score)
             coverage_scores.append(transition.info.coverage_score)
             episode_ids.append(transition.info.episode_id)
             timesteps.append(transition.info.timestep)
 
-            # V2新增：提取raw_obs（向后兼容，静默处理None）
-            if obs.raw_obs is not None:
-                raw_observations.append(obs.raw_obs)
-                # 提取用户状态
-                if 'user' in obs.raw_obs and 'user_state' in obs.raw_obs['user']:
+            # Oracle信息（仅用于分析）
+            if obs.raw_obs is not None and 'user' in obs.raw_obs:
+                if 'user_state' in obs.raw_obs['user']:
                     user_states.append(obs.raw_obs['user']['user_state'].cpu().numpy())
                     user_bored.append(obs.raw_obs['user']['bored'].cpu().numpy())
                 else:
-                    # 如果raw_obs存在但结构不完整，填充默认值
                     user_states.append(np.zeros(10))
                     user_bored.append(np.zeros(10, dtype=bool))
             else:
-                # 旧数据或默认模式：填充None和默认值
-                raw_observations.append(None)
                 user_states.append(np.zeros(10))
                 user_bored.append(np.zeros(10, dtype=bool))
 
-            if next_obs.raw_obs is not None:
-                raw_next_observations.append(next_obs.raw_obs)
-            else:
-                raw_next_observations.append(None)
-
-            # V3新增：提取Oracle信息（向后兼容）
             if transition.info.item_relevances is not None:
                 item_relevances.append(transition.info.item_relevances.cpu().numpy())
             else:
-                # 兼容旧数据：填充零向量
-                item_relevances.append(np.zeros(1000))  # 默认1000个物品
+                item_relevances.append(np.zeros(1000))
         
-        # 转换为numpy数组
+        # 🔥 V4重构：转换为numpy数组（移除observations和actions）
         d4rl_data = {
-            # 标准D4RL字段
-            'observations': np.array(observations),
-            'actions': np.array(actions),
+            # 核心训练数据
             'rewards': np.array(rewards),
-            'next_observations': np.array(next_observations),
             'terminals': np.array(terminals),
             'timeouts': np.array(timeouts),
 
-            # Slate推荐特有字段
+            # Slate推荐核心字段（训练必需）
             'slates': np.array(slates),
             'clicks': np.array(clicks),
+            'next_slates': np.array(next_slates),  # 🔥🔥🔥 [FIX] 必须添加！
+            'next_clicks': np.array(next_clicks),  # 🔥🔥🔥 [FIX] 必须添加！
             'diversity_scores': np.array(diversity_scores),
             'coverage_scores': np.array(coverage_scores),
             'episode_ids': np.array(episode_ids),
             'timesteps': np.array(timesteps),
 
-            # V2新增字段（向后兼容）
-            'raw_observations': np.array(raw_observations, dtype=object),
-            'raw_next_observations': np.array(raw_next_observations, dtype=object),
+            # Oracle信息（仅用于分析，不用于训练）
             'user_states': np.array(user_states),
             'user_bored': np.array(user_bored),
-
-            # V3新增字段（Oracle信息）
             'item_relevances': np.array(item_relevances),
         }
         
         return d4rl_data
     
     def save(self, filepath: str, format: str = 'pickle'):
-        """保存数据集"""
+        """
+        保存数据集（V4重构版）
+
+        🔥 重大变更：Oracle信息单独保存
+        - 核心训练数据保存到主文件
+        - Oracle信息（user_states, user_bored, item_relevances）保存到 *_oracle.npz
+        """
         Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        
+
         if format == 'pickle':
             with open(filepath, 'wb') as f:
                 pickle.dump(self, f)
         elif format == 'd4rl':
             d4rl_data = self.to_d4rl_format()
-            np.savez_compressed(filepath, **d4rl_data)
+
+            # 🔥 V4重构：分离核心数据和Oracle数据
+            core_data = {
+                'rewards': d4rl_data['rewards'],
+                'terminals': d4rl_data['terminals'],
+                'timeouts': d4rl_data['timeouts'],
+                'slates': d4rl_data['slates'],
+                'clicks': d4rl_data['clicks'],
+                'next_slates': d4rl_data['next_slates'],  # 🔥 [FIX] 添加
+                'next_clicks': d4rl_data['next_clicks'],  # 🔥 [FIX] 添加
+                'diversity_scores': d4rl_data['diversity_scores'],
+                'coverage_scores': d4rl_data['coverage_scores'],
+                'episode_ids': d4rl_data['episode_ids'],
+                'timesteps': d4rl_data['timesteps'],
+            }
+
+            oracle_data = {
+                'user_states': d4rl_data['user_states'],
+                'user_bored': d4rl_data['user_bored'],
+                'item_relevances': d4rl_data['item_relevances'],
+            }
+
+            # 保存核心训练数据
+            np.savez_compressed(filepath, **core_data)
+
+            # 保存Oracle数据到单独文件
+            oracle_path = filepath.replace('_data_d4rl.npz', '_oracle.npz')
+            np.savez_compressed(oracle_path, **oracle_data)
+
+            print(f"  核心数据: {filepath}")
+            print(f"  Oracle数据: {oracle_path}")
         else:
             raise ValueError(f"Unsupported format: {format}")
     

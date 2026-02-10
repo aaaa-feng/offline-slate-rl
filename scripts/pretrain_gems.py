@@ -32,7 +32,7 @@ from rankers.gems.data_utils import SlateDataModule
 from rankers.gems.rankers import GeMS
 from rankers.gems.argument_parser import MainParser
 from rankers.gems.item_embeddings import ItemEmbeddings, MFEmbeddings
-from common.logger import SwanlabLogger
+from common.online.logger import SwanlabLogger
 
 # Save original command line arguments for logging
 _original_argv = sys.argv.copy()
@@ -40,7 +40,8 @@ _original_argv = sys.argv.copy()
 main_parser = ArgumentParser()
 main_parser.add_argument("--ranker", type=str, required=True, choices=["GeMS"], help="Ranker type")
 main_parser.add_argument("--dataset", type=str, default=str(ONLINE_DATASETS_DIR / "focused_topdown.pt"), help="Path to dataset")
-main_parser.add_argument("--item_embedds", type=str, required=True, choices=["scratch", "mf_init", "mf_fixed"], help="Item embeddings.")
+main_parser.add_argument("--item_embedds", type=str, required=True, choices=["scratch", "mf_init", "mf_fixed", "pretrained"], help="Item embeddings.")
+main_parser.add_argument("--pretrained_embedds_path", type=str, default="data/embeddings/item_embeddings_diffuse.pt", help="Path to pretrained embeddings (used when item_embedds=pretrained)")
 
 def get_elem(l, ch):
     for i, el in enumerate(l):
@@ -51,6 +52,7 @@ def get_elem(l, ch):
 ranker_name = get_elem(sys.argv, "--ranker=")
 dataset_path = get_elem(sys.argv, "--dataset=")
 item_embedds = get_elem(sys.argv, "--item_embedds=")
+pretrained_embedds_path = get_elem(sys.argv, "--pretrained_embedds_path=")
 
 if ranker_name is None or item_embedds is None:
     print("Usage: python pretrain_gems.py --ranker=GeMS --dataset=<path> --item_embedds=scratch")
@@ -58,17 +60,24 @@ if ranker_name is None or item_embedds is None:
     print("  python scripts/pretrain_gems.py --ranker=GeMS --dataset=data/datasets/online/diffuse_topdown.pt --item_embedds=scratch --seed=58407201 --max_epochs=10")
     sys.exit(1)
 
-main_args = main_parser.parse_args([ranker_name, dataset_path, item_embedds])
+# Build main_args list
+main_args_list = [ranker_name, dataset_path, item_embedds]
+if pretrained_embedds_path is not None:
+    main_args_list.append(pretrained_embedds_path)
+
+main_args = main_parser.parse_args(main_args_list)
 sys.argv.remove(ranker_name)
 sys.argv.remove(dataset_path)
 sys.argv.remove(item_embedds)
+if pretrained_embedds_path is not None:
+    sys.argv.remove(pretrained_embedds_path)
 
 if main_args.ranker == "GeMS":
     ranker_class = GeMS
 else:
     raise NotImplementedError("This ranker is not trainable or has not been implemented yet.")
 
-if main_args.item_embedds in ["scratch"]:
+if main_args.item_embedds in ["scratch", "pretrained"]:
     item_embedd_class = ItemEmbeddings
 elif main_args.item_embedds in ["mf_init", "mf_fixed"]:
     item_embedd_class = MFEmbeddings
@@ -113,15 +122,22 @@ print_full_command()
 seed = int(args.seed)
 pl.seed_everything(seed)
 
+# Auto-generate run name if using default value
+if args.run_name == "test_run":
+    # Extract dataset name from path (e.g., "mix_divpen_epsilon-greedy" from full path)
+    dataset_name = Path(main_args.dataset).stem
+    args.run_name = f"gems_{dataset_name}_latent{args.latent_dim}_seed{args.seed}"
+
+# Prepare logger configuration
 logger_arg_dict = {**vars(args), **vars(main_args)}
 logger_kwargs = {
-    "project": args.swan_project or arg_dict["exp_name"],
+    "project": args.swan_project or args.exp_name,
     "experiment_name": args.run_name,
     "workspace": args.swan_workspace,
     "description": args.swan_description,
     "tags": args.swan_tags,
     "config": logger_arg_dict,
-    "mode": args.swan_mode,
+    "mode": args.swan_mode or "cloud",
     "logdir": args.swan_logdir,
     "run_id": args.swan_run_id,
     "resume": args.swan_resume,
@@ -138,6 +154,12 @@ else:
 
 if main_args.item_embedds in ["scratch"]:
     item_embeddings = ItemEmbeddings.from_scratch(args.num_items, args.item_embedd_dim, device=args.device)
+elif main_args.item_embedds == "pretrained":
+    # Load pretrained embeddings directly
+    print(f"Loading pretrained embeddings from: {main_args.pretrained_embedds_path}")
+    item_embeddings = ItemEmbeddings.from_pretrained(main_args.pretrained_embedds_path, args.device)
+    item_embeddings.freeze()  # Freeze pretrained embeddings
+    print(f"✓ Loaded and froze pretrained embeddings")
 elif main_args.item_embedds.startswith("mf"):
     if args.MF_checkpoint is None:
         item_embeddings = MFEmbeddings(**arg_dict)
