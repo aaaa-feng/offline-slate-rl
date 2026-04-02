@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Dict, Any
 import warnings
 
-# 项目根目录
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 项目根目录 (config/offline/env_loader.py -> config/offline -> config -> 项目根)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # 数据集根目录
 DATASETS_ROOT = PROJECT_ROOT / "data" / "datasets" / "offline"

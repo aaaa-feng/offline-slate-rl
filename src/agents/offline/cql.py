@@ -26,8 +26,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT.parent))
 
-from config import paths
-from config.offline_config import CQLConfig, auto_generate_paths, auto_generate_swanlab_config
+from config.offline import paths
+from config.offline.config import CQLConfig, auto_generate_paths, auto_generate_swanlab_config
 from common.offline.buffer import TrajectoryReplayBuffer
 from common.offline.utils import set_seed, soft_update
 from common.offline.networks import TanhGaussianActor, Critic
@@ -254,7 +254,12 @@ class CQLAgent:
 
     @torch.no_grad()
     def act(self, obs: Dict[str, Any], deterministic: bool = True) -> np.ndarray:
-        """Select action using Actor GRU"""
+        """
+        Select action using Actor GRU and decode to slate.
+
+        Returns:
+            slate: numpy array of shape [rec_size] containing item IDs
+        """
         # 统一转为 Tensor (无 Batch 维度)
         slate = torch.as_tensor(obs["slate"], dtype=torch.long, device=self.device)
         clicks = torch.as_tensor(obs["clicks"], dtype=torch.long, device=self.device)
@@ -269,8 +274,29 @@ class CQLAgent:
         raw_action, _ = self.actor(belief_state, deterministic=deterministic, need_log_prob=False)
 
         # Denormalize
-        action = raw_action * self.action_scale + self.action_center
-        return action.cpu().numpy().flatten()
+        latent_action = raw_action * self.action_scale + self.action_center
+
+        # 🔥 使用 ranker 解码 latent action 为 slate
+        if self.ranker is None:
+            raise RuntimeError(
+                "CQLAgent.act() requires a ranker for slate decoding. "
+                "Please provide ranker during initialization."
+            )
+
+        # 🔧 确保设备一致性 - 使用 ranker 的设备
+        ranker_device = next(self.ranker.parameters()).device
+        latent_action = latent_action.to(ranker_device)
+
+        # 添加 batch 维度 (ranker 期望 [batch_size, latent_dim])
+        latent_action_batched = latent_action.unsqueeze(0)  # [1, latent_dim]
+
+        # 解码为 slate
+        slate_tensor = self.ranker.rank(latent_action_batched)  # [1, rec_size]
+
+        # 移除 batch 维度并转换为 numpy
+        slate_output = slate_tensor.squeeze(0).cpu().numpy()  # [rec_size]
+
+        return slate_output
 
     def reset_hidden(self):
         """Reset dual-stream GRU hidden states"""
@@ -436,48 +462,27 @@ def train_cql(config: CQLConfig):
     logging.info(f"  Total transitions: {len(dataset['slates'])}")
 
     # ========================================================================
-    # Load GeMS (必须在重打标之前)
+    # 🔥 Load ranker dynamically using RankerFactory
     # ========================================================================
-    logging.info(f"\n{'='*80}")
-    logging.info("Loading GeMS checkpoint")
-    logging.info(f"{'='*80}")
+    from common.offline.ranker_factory import RankerFactory
 
-    # 使用统一配置模块解析checkpoint路径和参数
-    gems_path, lambda_click = resolve_gems_checkpoint(
-        env_name=config.env_name,
-        dataset_quality=config.dataset_quality
+    logging.info("=" * 80)
+    logging.info("=== Loading Ranker via RankerFactory ===")
+    logging.info(f"Ranker type: {config.ranker_type}")
+    logging.info("=" * 80)
+
+    ranker, action_dim, agent_embeddings = RankerFactory.create(
+        ranker_type=config.ranker_type,
+        config=config,
+        device=config.device
     )
-    logging.info(f"GeMS checkpoint: {gems_path}")
-    logging.info(f"Lambda click: {lambda_click}")
 
-    # Load temporary embeddings for GeMS initialization
-    temp_embeddings = ItemEmbeddings.from_pretrained(config.item_embedds_path, config.device)
+    # Get action dimension from ranker (unified interface)
+    action_dim, _ = ranker.get_action_dim()
 
-    # Load GeMS checkpoint
-    from rankers.gems.rankers import GeMS
-    ranker = GeMS.load_from_checkpoint(
-        gems_path,
-        map_location=config.device,
-        item_embeddings=temp_embeddings,
-        item_embedd_dim=config.item_embedd_dim,
-        device=config.device,
-        rec_size=config.rec_size,
-        latent_dim=32,
-        lambda_click=lambda_click,
-        lambda_KL=1.0,
-        lambda_prior=1.0,
-        ranker_lr=3e-3,
-        fixed_embedds="scratch",
-        ranker_sample=False,
-        hidden_layers_infer=[512, 256],
-        hidden_layers_decoder=[256, 512]
-    )
-    ranker.freeze()
-    logging.info("✅ GeMS checkpoint loaded")
-
-    # 显式强制设备同步
-    ranker = ranker.to(config.device)
-    logging.info(f"✅ GeMS moved to {config.device}")
+    logging.info(f"✅ Ranker loaded: {config.ranker_type}")
+    logging.info(f"  Action dim: {action_dim}")
+    logging.info("")
 
     # ========================================================================
     # 🔥 Solution B: Real-time Action Inference (No Pre-computed Actions)
@@ -491,8 +496,8 @@ def train_cql(config: CQLConfig):
     logging.info("=" * 80)
     logging.info("")
 
-    # Get action dimension from ranker
-    action_dim = ranker.latent_dim
+    # Action dim already obtained from RankerFactory.create()
+    # No need to get it again
 
     # Create buffer
     replay_buffer = TrajectoryReplayBuffer(device=config.device)
@@ -539,21 +544,6 @@ def train_cql(config: CQLConfig):
     logging.info(f"  center mean: {action_center.mean().item():.6f}")
     logging.info(f"  scale mean: {action_scale.mean().item():.6f}")
     logging.info("")
-
-    # Extract GeMS-trained embeddings (GeMS already loaded before relabeling)
-    logging.info(f"\n{'='*80}")
-    logging.info("Extracting embeddings from GeMS")
-    logging.info(f"{'='*80}")
-    gems_embedding_weights = ranker.item_embeddings.weight.data.clone()
-    logging.info(f"✅ Extracted embeddings: shape={gems_embedding_weights.shape}")
-
-    # Create agent's ItemEmbeddings with GeMS weights
-    agent_embeddings = ItemEmbeddings(
-        num_items=ranker.num_items,
-        item_embedd_dim=config.item_embedd_dim,
-        device=config.device,
-        weights=gems_embedding_weights
-    )
 
     # Freeze embeddings
     for param in agent_embeddings.parameters():
@@ -763,6 +753,11 @@ if __name__ == "__main__":
     parser.add_argument("--n_hidden", type=int, default=2,
                         help="隐藏层数量")
 
+    # 🔥 Ranker configuration (解耦架构)
+    parser.add_argument("--ranker", type=str, default="gems",
+                        choices=["gems", "topk", "kheadargmax"],
+                        help="Ranker类型: gems, topk, kheadargmax")
+
     # SwanLab configuration
     parser.add_argument("--use_swanlab", action="store_true", default=True,
                         help="是否使用SwanLab")
@@ -792,6 +787,7 @@ if __name__ == "__main__":
         hidden_dim=args.hidden_dim,
         n_hidden=args.n_hidden,
         use_swanlab=args.use_swanlab,
+        ranker_type=args.ranker,  # 🔥 NEW: Ranker selection
     )
 
     train_cql(config)

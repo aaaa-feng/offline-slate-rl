@@ -164,11 +164,7 @@ class TopicRec(RecSim):
             torch.save(self.item_embedd, str(get_embeddings_path("item_embeddings_focused.pt")))
         else:
             # 导入路径配置
-            import sys
-            from pathlib import Path
-            project_root = Path(__file__).resolve().parents[3]
-            sys.path.insert(0, str(project_root / "config"))
-            from paths import get_embeddings_path
+            from config.offline.paths import get_embeddings_path
             self.item_embedd = torch.load(str(get_embeddings_path(self.env_embedds)), map_location = self.device)
 
 
@@ -216,20 +212,46 @@ class TopicRec(RecSim):
     def get_item_embeddings(self) -> torch.FloatTensor:
         return self.item_embedd
 
-    def click_model(self, rels : torch.FloatTensor, comps : torch.LongTensor) -> torch.LongTensor:
+    def click_model(self, rels: torch.FloatTensor, comps: torch.LongTensor, 
+                    return_probs: bool = False):
         '''
-            UBM click model
+            UBM click model with attribution probes
+            
+            Args:
+                rels: Relevance scores for each position
+                comps: Component (topic) IDs for each item
+                return_probs: Whether to return click probabilities
+            
+            Returns:
+                if return_probs=False: clicks (torch.LongTensor)
+                if return_probs=True: (clicks, click_probs, diversity_triggered, attr)
         '''
+        # Check diversity constraint
+        unique_counts = torch.unique(comps, return_counts=True)[1]
+        max_topic_count = torch.max(unique_counts) if len(unique_counts) > 0 else torch.tensor(0, device=self.device)
+        diversity_triggered = max_topic_count >= self.diversity_threshold
+        
+        # Compute attractiveness with diversity penalty
         attr = self.alpha * rels
-        if torch.max(torch.unique(comps, return_counts = True)[1]) >= self.diversity_threshold:
-            attr /= self.diversity_penalty ### When too many similar are in the slate, the overall attractiveness of the slate decreases.
-        clicks = torch.empty(self.rec_size, device = self.device, dtype = torch.long)
+        if diversity_triggered:
+            attr = attr / self.diversity_penalty  # When too many similar items, reduce attractiveness
+        
+        # Compute click probabilities and sample clicks
+        clicks = torch.empty(self.rec_size, device=self.device, dtype=torch.long)
+        click_probs = torch.empty(self.rec_size, device=self.device, dtype=torch.float)
         rank_latest_click = -1
+        
         for rank in range(self.rec_size):
+            # Position bias * attractiveness
             click_prob = attr[rank] * self.propensities[rank, rank_latest_click]
-            clicks[rank] = torch.bernoulli(click_prob, generator = self.rd_gen)
+            click_probs[rank] = click_prob
+            clicks[rank] = torch.bernoulli(click_prob, generator=self.rd_gen)
             if clicks[rank]:
                 rank_latest_click = rank
+        
+        # 向后兼容：return_probs=False 时只返回 clicks
+        if return_probs:
+            return clicks, click_probs, diversity_triggered, attr
         return clicks
 
     def reset(self) -> Tuple[Dict, Dict]:
@@ -352,8 +374,33 @@ class TopicRec(RecSim):
         info["scores"] = norm_score
         info["bored"] = self.bored
 
-        ## Interaction
-        clicks = self.click_model(relevances, self.item_comp[slate])
+        ## Interaction - with attribution probes
+        clicks, click_probs, diversity_triggered, attr = self.click_model(
+            relevances, self.item_comp[slate], return_probs=True
+        )
+        
+        # ========== 归因探针信息写入 ==========
+        # 1. Boredom 指标
+        info["bored_topic_count"] = int(torch.sum(self.bored).item())
+        
+        # 2. Diversity Penalty 指标
+        info["diversity_penalty_triggered"] = bool(diversity_triggered)
+        
+        # 3. Repeat Exposure 指标（已点击物品再次曝光）
+        slate_items = slate.tolist()
+        repeat_exposure_count = sum(1 for item in slate_items if item in self.all_clicked_items)
+        info["repeat_exposure_count"] = repeat_exposure_count
+        info["repeat_exposure_ratio"] = repeat_exposure_count / self.rec_size
+        
+        # 4. Expected Clicks 指标（基于概率的期望点击）
+        info["expected_clicks"] = float(torch.sum(click_probs).item())
+        info["actual_clicks"] = int(torch.sum(clicks).item())
+        
+        # 5. Click probabilities per position（用于细粒度分析）
+        info["click_probs"] = click_probs
+        info["attractiveness"] = attr
+        # =====================================
+        
         clicked_items = torch.where(clicks)[0]
         self.clicked_items.extend(self.item_comp[slate[clicked_items]])
         self.clicked_step.extend(self.t * torch.ones_like(clicked_items))

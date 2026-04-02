@@ -31,16 +31,22 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT.parent))
 
-from config import paths
-from config.offline_config import IQLConfig, auto_generate_paths, auto_generate_swanlab_config
+from config.offline import paths
+from config.offline.config import IQLConfig, auto_generate_paths, auto_generate_swanlab_config
 from common.offline.buffer import TrajectoryReplayBuffer
 from common.offline.utils import set_seed, soft_update
-from common.offline.networks import TanhGaussianActor, Critic, ValueFunction
+from common.offline.networks import (
+    TanhGaussianActor,
+    DeterministicActor,
+    FixedGaussianActor,
+    Critic,
+    ValueFunction,
+    LOG_STD_MIN,
+    LOG_STD_MAX,
+)
 from common.offline.eval_env import OfflineEvalEnv
-from common.offline.checkpoint_utils import resolve_gems_checkpoint
 from belief_encoders.gru_belief import GRUBelief
 from rankers.gems.item_embeddings import ItemEmbeddings
-from rankers.gems.rankers import GeMS
 
 # SwanLab Logger
 try:
@@ -153,6 +159,10 @@ class IQLAgent:
         # Extract action normalization parameters from ranker_params
         self.action_center = ranker_params['action_center'].to(self.device)
         self.action_scale = ranker_params['action_scale'].to(self.device)
+        
+        # 🔥 NEW: Extract dataset latent space global range (for probe)
+        self.dataset_center = ranker_params.get('dataset_center', self.action_center).to(self.device)
+        self.action_range = ranker_params.get('action_range', self.action_scale * 2).to(self.device)
 
         # Extract GeMS-trained embeddings from ranker_params
         self.item_embeddings = ranker_params['item_embeddings']
@@ -183,14 +193,38 @@ class IQLAgent:
             self.belief.item_embeddings[module].freeze()
         logging.info("✅ Item embeddings frozen (double-checked)")
 
-        # Actor
-        self.actor = TanhGaussianActor(
-            state_dim=config.belief_hidden_dim,
-            action_dim=action_dim,
-            max_action=self.max_action,
-            hidden_dim=config.hidden_dim,
-            n_hidden=config.n_hidden,
-        ).to(self.device)
+        # Actor - support multiple architectures
+        if config.actor_type == "gaussian":
+            self.actor = TanhGaussianActor(
+                state_dim=config.belief_hidden_dim,
+                action_dim=action_dim,
+                max_action=self.max_action,
+                hidden_dim=config.hidden_dim,
+                n_hidden=config.n_hidden,
+            ).to(self.device)
+            logging.info(f"✅ Using TanhGaussianActor (learnable variance)")
+        elif config.actor_type == "deterministic":
+            self.actor = DeterministicActor(
+                state_dim=config.belief_hidden_dim,
+                action_dim=action_dim,
+                max_action=self.max_action,
+                hidden_dim=config.hidden_dim,
+                n_hidden=config.n_hidden,
+            ).to(self.device)
+            logging.info(f"✅ Using DeterministicActor (no variance)")
+        elif config.actor_type == "fixed_gaussian":
+            self.actor = FixedGaussianActor(
+                state_dim=config.belief_hidden_dim,
+                action_dim=action_dim,
+                max_action=self.max_action,
+                hidden_dim=config.hidden_dim,
+                n_hidden=config.n_hidden,
+                fixed_std=config.fixed_std,
+            ).to(self.device)
+            logging.info(f"✅ Using FixedGaussianActor (fixed_std={config.fixed_std})")
+        else:
+            raise ValueError(f"Unknown actor_type: {config.actor_type}")
+
 
         # Critics
         self.critic_1 = Critic(config.belief_hidden_dim, action_dim, config.hidden_dim).to(self.device)
@@ -240,14 +274,17 @@ class IQLAgent:
         s_critic = states["critic"]
         ns_critic = next_states["critic"]
 
-        # Real-time action inference with fake_clicks=0 (zero-padding for consistency)
+        # Real-time action inference for label actions (A/B via CLI)
         flat_slates = torch.cat(batch.obs["slate"], dim=0)
+        flat_clicks = torch.cat(batch.obs["clicks"], dim=0)
 
-        # 🔥 Use fake_clicks=0 to eliminate click noise (consistent supervision)
-        fake_clicks = torch.zeros_like(flat_slates, dtype=torch.float32)
+        if self.config.label_click_mode == "real":
+            label_clicks = flat_clicks.float()
+        else:
+            label_clicks = torch.zeros_like(flat_slates, dtype=torch.float32)
 
         with torch.no_grad():
-            true_actions, _ = self.ranker.run_inference(flat_slates, fake_clicks)
+            true_actions, _ = self.ranker.run_inference(flat_slates, label_clicks)
             true_actions = (true_actions - self.action_center) / self.action_scale
 
             # 🔥 SAFETY CLAMP: Architecture Alignment
@@ -277,8 +314,11 @@ class IQLAgent:
 
             # Raw version (what would happen without clamping)
             # This will produce NaN if |action_ratio| > 1
-            atanh_raw = torch.atanh(action_ratio.clamp(-1.0, 1.0))  # clamp to valid domain
+            # 🔥 FIX: Compute domain violation rate BEFORE clamping for proper diagnosis
+            atanh_domain_violation_rate = (action_ratio.abs() > 1.0).float().mean().item()
+            atanh_raw = torch.atanh(action_ratio)  # True raw computation without clamp
             atanh_raw_has_nan = torch.isnan(atanh_raw).any().item()
+            atanh_raw_has_inf = torch.isinf(atanh_raw).any().item()
 
             # 3. Extreme Values - Maximum Deviation
             true_action_abs_max = true_actions.abs().max().item()
@@ -292,8 +332,7 @@ class IQLAgent:
         # ========================================================================
         with torch.no_grad():
             # Compute target Q-values
-            target_q1 = self.critic_1_target.q1(s_critic, true_actions)
-            target_q2 = self.critic_2_target.q1(s_critic, true_actions)
+            target_q1, target_q2 = self.critic_1_target.both(s_critic, true_actions)
             target_q = torch.min(target_q1, target_q2)
 
         # Current V-value (keep gradient flow to GRU)
@@ -333,8 +372,7 @@ class IQLAgent:
 
         # Current Q-values (detach s_critic to avoid gradient conflict)
         # Reason: Value optimizer already updated GRU in Step 1
-        current_q1 = self.critic_1.q1(s_critic.detach(), true_actions)
-        current_q2 = self.critic_2.q1(s_critic.detach(), true_actions)
+        current_q1, current_q2 = self.critic_1.both(s_critic.detach(), true_actions)
 
         # 🔥 Numerical Stability: Clamp current Q values
         current_q1 = torch.clamp(current_q1, min=-100.0, max=100.0)
@@ -375,8 +413,7 @@ class IQLAgent:
         with torch.no_grad():
             # Compute advantage using s_critic
             v = self.value(s_critic.detach())
-            q1 = self.critic_1.q1(s_critic.detach(), true_actions)
-            q2 = self.critic_2.q1(s_critic.detach(), true_actions)
+            q1, q2 = self.critic_1.both(s_critic.detach(), true_actions)
             q = torch.min(q1, q2)
             advantage = q - v
 
@@ -398,59 +435,218 @@ class IQLAgent:
             weight_max = exp_adv.max().item()
             weight_mean = exp_adv.mean().item()
 
-        # Actor log probability (uses s_actor, keep gradient flow to GRU)
-        # 🔧 NUMERICAL STABILITY FIX: Clamp true_actions to prevent out-of-distribution values
-        # that cause NaN in log_prob computation (before calling log_prob)
-        true_actions_clamped = torch.clamp(true_actions, min=-3.0, max=3.0)
+        # FIX P2: align true_actions to the valid atanh domain [-0.999, 0.999]
+        # The previous clamp to [-3.0, 3.0] was dead code (true_actions already
+        # clamped to [-0.99, 0.99] above) and misaligned with networks.py safe_action
+        true_actions_clamped = torch.clamp(true_actions, min=-0.999, max=0.999)
 
         # 🔍 FORENSIC MONITOR 4: Policy Internal Diagnostics
-        # Get actor distribution parameters (mu, log_std)
+        # Branch by actor_type to avoid AttributeError
         with torch.no_grad():
-            hidden = self.actor.trunk(s_actor)
-            actor_mu = self.actor.mu(hidden)
-            actor_log_std = self.actor.log_std(hidden)
+            if self.config.actor_type == "deterministic":
+                # Deterministic actor: only has mu, no log_std
+                hidden = self.actor.trunk(s_actor)
+                actor_mu = self.actor.mu(hidden)
 
-            # Actor output statistics
-            actor_mu_min = actor_mu.min().item()
-            actor_mu_max = actor_mu.max().item()
-            actor_mu_mean = actor_mu.mean().item()
+                # Actor mu statistics
+                actor_mu_min = actor_mu.min().item()
+                actor_mu_max = actor_mu.max().item()
+                actor_mu_mean = actor_mu.mean().item()
 
-            actor_log_std_min = actor_log_std.min().item()
-            actor_log_std_mean = actor_log_std.mean().item()
-            actor_log_std_max = actor_log_std.max().item()
+                # ⚠️ Dummy values for log_std (deterministic has no variance)
+                actor_log_std_raw_min = 0.0
+                actor_log_std_raw_mean = 0.0
+                actor_log_std_raw_max = 0.0
+                actor_log_std_min = 0.0
+                actor_log_std_mean = 0.0
+                actor_log_std_max = 0.0
+                actor_log_std_floor_hit_rate = 0.0
+                actor_log_std_ceiling_hit_rate = 0.0
 
-            # 🔍 FORENSIC MONITOR 4B: Gaussian Intermediate Terms
-            # Compute the problematic term: 1 - (action / max_action)^2
-            action_ratio = true_actions_clamped / self.max_action
-            action_ratio_squared = action_ratio.pow(2)
-            jacobian_term = 1 - action_ratio_squared
+                # Jacobian term (still relevant for action clamping)
+                action_ratio = true_actions_clamped / self.max_action
+                action_ratio_squared = action_ratio.pow(2)
+                jacobian_term = 1 - action_ratio_squared
+                jacobian_term_min = jacobian_term.min().item()
+                jacobian_term_max = jacobian_term.max().item()
+                jacobian_term_has_negative = (jacobian_term <= 0).any().item()
+                jacobian_term_has_nan = torch.isnan(jacobian_term).any().item()
 
-            jacobian_term_min = jacobian_term.min().item()
-            jacobian_term_max = jacobian_term.max().item()
-            jacobian_term_has_negative = (jacobian_term <= 0).any().item()
-            jacobian_term_has_nan = torch.isnan(jacobian_term).any().item()
+                # Mu distribution analysis
+                mu_after_tanh = torch.tanh(actor_mu)
+                tanh_saturation_ratio = (mu_after_tanh.abs() > 0.95).float().mean().item()
+                mu_percentiles = torch.quantile(actor_mu, torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=actor_mu.device))
+                mu_p10 = mu_percentiles[0].item()
+                mu_p25 = mu_percentiles[1].item()
+                mu_p50 = mu_percentiles[2].item()
+                mu_p75 = mu_percentiles[3].item()
+                mu_p90 = mu_percentiles[4].item()
+                mu_iqr = mu_p75 - mu_p10
+                policy_distance_to_origin = torch.norm(actor_mu, dim=-1).mean().item()
 
-        log_prob = self.actor.log_prob(s_actor, true_actions_clamped)
+                # ⚠️ Dummy values for per-dimension log_std analysis
+                max_per_dim_floor_hit = 0.0
+                mean_per_dim_floor_hit = 0.0
+                num_dims_with_high_floor_hit = 0
 
-        # 🔍 FORENSIC MONITOR 5: Log Probability Stability (before clipping)
-        log_prob_min_raw = log_prob.min().item()
-        log_prob_max_raw = log_prob.max().item()
+            elif self.config.actor_type == "fixed_gaussian":
+                # Fixed Gaussian: mu is learnable, log_std is fixed buffer
+                hidden = self.actor.trunk(s_actor)
+                actor_mu = self.actor.mu(hidden)
+                actor_log_std = self.actor.log_std  # Fixed buffer, not a function call
 
-        # 🔧 NUMERICAL STABILITY FIX: Clamp log_prob to prevent -inf underflow and NaN
-        log_prob = torch.clamp(log_prob, min=-20.0, max=0.0)
+                # Actor mu statistics
+                actor_mu_min = actor_mu.min().item()
+                actor_mu_max = actor_mu.max().item()
+                actor_mu_mean = actor_mu.mean().item()
 
-        # 🔥 NEW METRIC: Policy Entropy (监控策略是否坍缩)
-        policy_entropy = -log_prob.mean().item()
+                # Log_std statistics (fixed, so raw = clamped)
+                actor_log_std_raw_min = actor_log_std.min().item()
+                actor_log_std_raw_mean = actor_log_std.mean().item()
+                actor_log_std_raw_max = actor_log_std.max().item()
+                actor_log_std_min = actor_log_std.min().item()
+                actor_log_std_mean = actor_log_std.mean().item()
+                actor_log_std_max = actor_log_std.max().item()
+                # Floor/ceiling hit rate = 0 (log_std is fixed, never hits bounds)
+                actor_log_std_floor_hit_rate = 0.0
+                actor_log_std_ceiling_hit_rate = 0.0
 
-        # Actor loss (AWR)
-        actor_loss = -(exp_adv * log_prob).mean()
+                # Jacobian term
+                action_ratio = true_actions_clamped / self.max_action
+                action_ratio_squared = action_ratio.pow(2)
+                jacobian_term = 1 - action_ratio_squared
+                jacobian_term_min = jacobian_term.min().item()
+                jacobian_term_max = jacobian_term.max().item()
+                jacobian_term_has_negative = (jacobian_term <= 0).any().item()
+                jacobian_term_has_nan = torch.isnan(jacobian_term).any().item()
+
+                # Mu distribution analysis
+                mu_after_tanh = torch.tanh(actor_mu)
+                tanh_saturation_ratio = (mu_after_tanh.abs() > 0.95).float().mean().item()
+                mu_percentiles = torch.quantile(actor_mu, torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=actor_mu.device))
+                mu_p10 = mu_percentiles[0].item()
+                mu_p25 = mu_percentiles[1].item()
+                mu_p50 = mu_percentiles[2].item()
+                mu_p75 = mu_percentiles[3].item()
+                mu_p90 = mu_percentiles[4].item()
+                mu_iqr = mu_p75 - mu_p10
+                policy_distance_to_origin = torch.norm(actor_mu, dim=-1).mean().item()
+
+                # ⚠️ Dummy values for per-dimension log_std analysis (fixed variance)
+                max_per_dim_floor_hit = 0.0
+                mean_per_dim_floor_hit = 0.0
+                num_dims_with_high_floor_hit = 0
+
+            else:
+                # Gaussian actor: learnable mu and log_std
+                hidden = self.actor.trunk(s_actor)
+                actor_mu = self.actor.mu(hidden)
+                actor_log_std_raw = self.actor.log_std(hidden)
+                actor_log_std = torch.clamp(actor_log_std_raw, min=LOG_STD_MIN, max=LOG_STD_MAX)
+
+                # Actor output statistics
+                actor_mu_min = actor_mu.min().item()
+                actor_mu_max = actor_mu.max().item()
+                actor_mu_mean = actor_mu.mean().item()
+
+                actor_log_std_raw_min = actor_log_std_raw.min().item()
+                actor_log_std_raw_mean = actor_log_std_raw.mean().item()
+                actor_log_std_raw_max = actor_log_std_raw.max().item()
+
+                actor_log_std_min = actor_log_std.min().item()
+                actor_log_std_mean = actor_log_std.mean().item()
+                actor_log_std_max = actor_log_std.max().item()
+                actor_log_std_floor_hit_rate = (actor_log_std_raw <= LOG_STD_MIN).float().mean().item()
+                actor_log_std_ceiling_hit_rate = (actor_log_std_raw >= LOG_STD_MAX).float().mean().item()
+
+                # 🔍 FORENSIC MONITOR 4B: Gaussian Intermediate Terms
+                # Compute the problematic term: 1 - (action / max_action)^2
+                action_ratio = true_actions_clamped / self.max_action
+                action_ratio_squared = action_ratio.pow(2)
+                jacobian_term = 1 - action_ratio_squared
+
+                jacobian_term_min = jacobian_term.min().item()
+                jacobian_term_max = jacobian_term.max().item()
+                jacobian_term_has_negative = (jacobian_term <= 0).any().item()
+                jacobian_term_has_nan = torch.isnan(jacobian_term).any().item()
+
+                # 🔍 FORENSIC MONITOR 4C: Distribution Analysis (Gemini suggestion)
+                # 1. Tanh Saturation - ratio of mu values pushed to boundaries
+                mu_after_tanh = torch.tanh(actor_mu)
+                tanh_saturation_ratio = (mu_after_tanh.abs() > 0.95).float().mean().item()
+
+                # 2. Mu Distribution Percentiles (Q10, Q25, Q50, Q75, Q90)
+                mu_percentiles = torch.quantile(actor_mu, torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=actor_mu.device))
+                mu_p10 = mu_percentiles[0].item()
+                mu_p25 = mu_percentiles[1].item()
+                mu_p50 = mu_percentiles[2].item()
+                mu_p75 = mu_percentiles[3].item()
+                mu_p90 = mu_percentiles[4].item()
+
+                # 3. Per-dimension log_std analysis (32 dimensions)
+                # Compute floor hit rate per dimension
+                per_dim_floor_hit = (actor_log_std_raw <= LOG_STD_MIN).float().mean(dim=0)  # [32]
+                per_dim_log_std_mean = actor_log_std.mean(dim=0)  # [32]
+
+                # Summary stats for per-dimension analysis
+                max_per_dim_floor_hit = per_dim_floor_hit.max().item()
+                mean_per_dim_floor_hit = per_dim_floor_hit.mean().item()
+                num_dims_with_high_floor_hit = (per_dim_floor_hit > 0.5).sum().item()  # How many dims have >50% floor hit
+
+                # Mu interquartile range (IQR) - measure of distribution spread
+                mu_iqr = mu_p75 - mu_p10
+
+                # 🔥 NEW: Policy distance to origin (data mean) - for BC gravity evidence
+                policy_distance_to_origin = torch.norm(actor_mu, dim=-1).mean().item()
+
+        # 🔥 Actor Loss - branch by actor_type
+        if self.config.actor_type == "deterministic":
+            # Deterministic actor: use weighted MSE instead of log_prob
+            actor_mu = self.actor.get_mu(s_actor)
+            actor_action = torch.tanh(actor_mu) * self.max_action
+            # Weighted MSE: exp_adv weights each sample
+            mse_per_sample = F.mse_loss(actor_action, true_actions_clamped, reduction='none').mean(dim=-1, keepdim=True)
+            awr_loss = (exp_adv * mse_per_sample).mean()
+
+            # BC loss (same as before)
+            bc_loss = F.mse_loss(actor_action, true_actions_clamped)
+
+            # No log_prob for deterministic actor
+            policy_entropy = 0.0
+            log_prob_min_raw = 0.0
+            log_prob_max_raw = 0.0
+        else:
+            # Gaussian actors (gaussian or fixed_gaussian): use log_prob
+            log_prob = self.actor.log_prob(s_actor, true_actions_clamped)
+
+            # 🔍 FORENSIC MONITOR 5: Log Probability Stability (before clipping)
+            log_prob_min_raw = log_prob.min().item()
+            log_prob_max_raw = log_prob.max().item()
+
+            # NOTE: clamp is now inside networks.py log_prob() at -100 instead of -20
+            # No additional clamp here - log_prob already has gradient-safe range
+
+            # 🔥 NEW METRIC: Policy Entropy (监控策略是否坍缩)
+            policy_entropy = -log_prob.mean().item()
+
+            # AWR loss
+            awr_loss = -(exp_adv * log_prob).mean()
+
+            # FIX P0: BC Loss - provides stable gradient independent of Advantage
+            # When AWR weights are near-uniform (advantage≈0), bc_loss keeps Actor
+            # tracking the data distribution and prevents gradient death
+            actor_mu, _ = self.actor(s_actor, deterministic=True)
+            bc_loss = F.mse_loss(actor_mu, true_actions_clamped)
+
+        lambda_bc = getattr(self.config, 'lambda_bc', 0.5)
+        actor_loss = awr_loss + lambda_bc * bc_loss
 
         # Optimize actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         actor_grad_norm = torch.nn.utils.clip_grad_norm_(
             list(self.belief.gru["actor"].parameters()) + list(self.actor.parameters()),
-            10.0
+            1.0  # FIX Phase 3: reduced from 10.0 — smaller steps prevent overshooting optimal policy
         )
         self.actor_optimizer.step()
 
@@ -461,11 +657,47 @@ class IQLAgent:
         # ========================================================================
         # 🔥 Enhanced Monitoring Metrics
         # ========================================================================
+        # 🔥 OOD Distance Probe: Actor 输出与数据集真实动作的距离
+        with torch.no_grad():
+            # 确定性动作的 OOD 距离
+            pred_actions_det, _ = self.actor(s_actor, deterministic=True)
+            ood_distances_det = torch.norm(pred_actions_det - true_actions_clamped, dim=-1)
+            ood_distance_mean_det = ood_distances_det.mean().item()
+            ood_distance_max_det = ood_distances_det.max().item()
+
+            # 采样动作的 OOD 距离（仅 Gaussian Actor）
+            if self.config.actor_type in ["gaussian", "fixed_gaussian"]:
+                pred_actions_samp, _ = self.actor(s_actor, deterministic=False)
+                ood_distances_samp = torch.norm(pred_actions_samp - true_actions_clamped, dim=-1)
+                ood_distance_mean_samp = ood_distances_samp.mean().item()
+                ood_distance_max_samp = ood_distances_samp.max().item()
+            else:
+                ood_distance_mean_samp = 0.0
+                ood_distance_max_samp = 0.0
+            
+            # 🔥 NEW: 潜空间全局定位探针 (到数据集中心/边界的距离)
+            # 1. 到数据集中心的距离
+            dist_to_center = torch.norm(pred_actions_det - self.dataset_center.to(pred_actions_det.device), dim=-1)
+            z_to_dataset_center_mean = dist_to_center.mean().item()
+            
+            # 2. 到数据集边界的距离 (相对值，0=在中心，1=在边界)
+            pred_normalized = (pred_actions_det - self.dataset_center.to(pred_actions_det.device)) / (self.action_range.to(pred_actions_det.device) / 2 + 1e-6)
+            dist_to_boundary = torch.abs(pred_normalized).max(dim=-1).values
+            z_to_boundary_mean = dist_to_boundary.mean().item()
+
+        # 🔥 采样时序监控：batch 平均 reward
+        if batch.rewards is not None:
+            batch_reward_mean = torch.cat(batch.rewards, dim=0).mean().item()
+        else:
+            batch_reward_mean = 0.0
+
         metrics = {
             # Loss metrics
             "value_loss": value_loss.item(),
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
+            "awr_loss": awr_loss.item(),
+            "bc_loss": bc_loss.item(),
 
             # V-value statistics (enhanced)
             "v_value_mean": current_v.mean().item(),
@@ -519,9 +751,28 @@ class IQLAgent:
             "actor_mu_min": actor_mu_min,
             "actor_mu_max": actor_mu_max,
             "actor_mu_mean": actor_mu_mean,
+            # Distribution percentiles
+            "mu_p10": mu_p10,
+            "mu_p25": mu_p25,
+            "mu_p50": mu_p50,
+            "mu_p75": mu_p75,
+            "mu_p90": mu_p90,
+            "mu_iqr": mu_iqr,
+            # Tanh saturation
+            "tanh_saturation_ratio": tanh_saturation_ratio,
+            # Per-dimension analysis
+            "max_per_dim_floor_hit": max_per_dim_floor_hit,
+            "mean_per_dim_floor_hit": mean_per_dim_floor_hit,
+            "num_dims_with_high_floor_hit": num_dims_with_high_floor_hit,
+            # Log std stats
+            "actor_log_std_raw_min": actor_log_std_raw_min,
+            "actor_log_std_raw_mean": actor_log_std_raw_mean,
+            "actor_log_std_raw_max": actor_log_std_raw_max,
             "actor_log_std_min": actor_log_std_min,
             "actor_log_std_mean": actor_log_std_mean,
             "actor_log_std_max": actor_log_std_max,
+            "actor_log_std_floor_hit_rate": actor_log_std_floor_hit_rate,
+            "actor_log_std_ceiling_hit_rate": actor_log_std_ceiling_hit_rate,
 
             # 🔍 FORENSIC: Jacobian Term (1 - (action/max_action)^2)
             "jacobian_term_min": jacobian_term_min,
@@ -538,6 +789,8 @@ class IQLAgent:
             "oob_rate": oob_rate,
             "atanh_protected_has_nan": atanh_protected_has_nan,
             "atanh_raw_has_nan": atanh_raw_has_nan,
+            "atanh_raw_has_inf": atanh_raw_has_inf,
+            "atanh_domain_violation_rate": atanh_domain_violation_rate,
             "true_action_abs_max": true_action_abs_max,
             "action_ratio_abs_max": action_ratio_abs_max,
 
@@ -545,6 +798,22 @@ class IQLAgent:
             "value_grad_norm": value_grad_norm.item(),
             "critic_grad_norm": critic_grad_norm.item(),
             "actor_grad_norm": actor_grad_norm.item(),
+
+            # 🔥 NEW: Policy distance to origin (BC gravity evidence)
+            "policy_distance_to_origin": policy_distance_to_origin,
+
+            # 🔥 OOD Distance Probe: Actor 输出与数据集真实动作的距离
+            "ood_distance_mean_det": ood_distance_mean_det,
+            "ood_distance_max_det": ood_distance_max_det,
+            "ood_distance_mean_samp": ood_distance_mean_samp,
+            "ood_distance_max_samp": ood_distance_max_samp,
+
+            # 🔥 NEW: 潜空间全局定位探针
+            "z_to_dataset_center_mean": z_to_dataset_center_mean,
+            "z_to_boundary_mean": z_to_boundary_mean,
+
+            # 🔥 采样时序监控探针
+            "batch_reward_mean": batch_reward_mean,
         }
 
         return metrics
@@ -743,7 +1012,8 @@ def train_iql(config: IQLConfig):
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-    log_filename = f"{config.env_name}_{config.dataset_quality}_expectile{config.tau}_seed{config.seed}_{config.run_id}.log"
+    ranker_type = getattr(config, 'ranker_type', 'unknown')
+    log_filename = f"{config.env_name}_{config.dataset_quality}_{ranker_type}_expectile{config.tau}_seed{config.seed}_{config.run_id}.log"
     log_filepath = os.path.join(config.log_dir, log_filename)
 
     for handler in logging.root.handlers[:]:
@@ -801,51 +1071,14 @@ def train_iql(config: IQLConfig):
 
     # Note: Buffer creation moved after action relabeling
 
-    # Load GeMS and extract embeddings
-    logging.info(f"\n{'='*80}")
-    logging.info("Loading GeMS checkpoint and extracting embeddings")
-    logging.info(f"{'='*80}")
+    # 🔥 Load ranker dynamically using RankerFactory
+    from common.offline.ranker_factory import RankerFactory
 
-    # 使用统一配置模块解析checkpoint路径和参数
-    gems_path, lambda_click = resolve_gems_checkpoint(
-        env_name=config.env_name,
-        dataset_quality=config.dataset_quality
+    ranker, action_dim, agent_embeddings = RankerFactory.create(
+        ranker_type=config.ranker_type,
+        config=config,
+        device=config.device
     )
-
-    logging.info(f"GeMS checkpoint: {gems_path}")
-    logging.info(f"Item embeddings: {config.item_embedds_path}")
-
-    # Load temporary embeddings for GeMS initialization
-    temp_embeddings = ItemEmbeddings.from_pretrained(config.item_embedds_path, config.device)
-
-    # Load GeMS checkpoint
-    ranker = GeMS.load_from_checkpoint(
-        gems_path,
-        map_location=config.device,
-        item_embeddings=temp_embeddings,
-        item_embedd_dim=config.item_embedd_dim,
-        device=config.device,
-        rec_size=config.rec_size,
-        latent_dim=32,
-        lambda_click=lambda_click,
-        lambda_KL=1.0,
-        lambda_prior=1.0,
-        ranker_lr=3e-3,
-        fixed_embedds="scratch",
-        ranker_sample=False,
-        hidden_layers_infer=[512, 256],
-        hidden_layers_decoder=[256, 512]
-    )
-    ranker.freeze()
-    logging.info("✅ GeMS checkpoint loaded")
-
-    # 显式强制设备同步 (对标eval_env.py的做法)
-    ranker = ranker.to(config.device)
-    logging.info(f"✅ GeMS moved to {config.device}")
-
-    # Extract GeMS-trained embeddings
-    gems_embedding_weights = ranker.item_embeddings.weight.data.clone()
-    logging.info(f"✅ Extracted embeddings: shape={gems_embedding_weights.shape}")
 
     # ========================================================================
     # 🔥 Solution B: Real-time Action Inference (No Pre-computed Actions)
@@ -854,8 +1087,8 @@ def train_iql(config: IQLConfig):
     logging.info("✅ Using real-time action inference (on-the-fly from slates/clicks)")
     logging.info("")
 
-    # Get action dimension from ranker
-    action_dim = ranker.latent_dim
+    # Get action dimension from ranker (unified interface for all rankers)
+    action_dim, _ = ranker.get_action_dim()
 
     # Create buffer
     replay_buffer = TrajectoryReplayBuffer(device=config.device)
@@ -869,8 +1102,8 @@ def train_iql(config: IQLConfig):
     }
     if 'rewards' in dataset:
         if config.normalize_rewards:
-            dataset_dict['rewards'] = dataset['rewards'] / 100.0
-            logging.info("⚡ Applied reward scaling: rewards / 100.0")
+            dataset_dict['rewards'] = dataset['rewards'] / config.reward_scale
+            logging.info(f"⚡ Applied reward scaling: rewards / {config.reward_scale}")
         else:
             dataset_dict['rewards'] = dataset['rewards']
     if 'terminals' in dataset:
@@ -884,34 +1117,38 @@ def train_iql(config: IQLConfig):
     # ========================================================================
     logging.info("")
     logging.info("Computing action normalization parameters...")
+    logging.info(f"Label click mode: {config.label_click_mode}")
 
     sample_size = min(10000, len(dataset['slates']))
     sample_indices = np.random.choice(len(dataset['slates']), sample_size, replace=False)
     sample_slates = torch.tensor(dataset['slates'][sample_indices], device=config.device, dtype=torch.long)
 
-    # 🔥 Use fake_clicks=0 for consistent normalization (same as training)
-    fake_clicks = torch.zeros_like(sample_slates, dtype=torch.float32)
+    if config.label_click_mode == "real":
+        sample_clicks = torch.tensor(dataset['clicks'][sample_indices], device=config.device, dtype=torch.float32)
+    else:
+        sample_clicks = torch.zeros_like(sample_slates, dtype=torch.float32)
 
     with torch.no_grad():
-        sample_actions, _ = ranker.run_inference(sample_slates, fake_clicks)
+        sample_actions, _ = ranker.run_inference(sample_slates, sample_clicks)
 
     action_min = sample_actions.min(dim=0)[0]
     action_max = sample_actions.max(dim=0)[0]
     action_center = (action_max + action_min) / 2
     action_scale = (action_max - action_min) / 2 + 1e-6
+    
+    # 🔥 NEW: 计算数据集潜空间全局范围 (用于探针)
+    dataset_center = (action_max + action_min) / 2  # 潜空间中心点 [latent_dim]
+    action_range = action_max - action_min  # 潜空间范围 [latent_dim]
 
     logging.info(f"✅ Action normalization computed from {sample_size} samples")
     logging.info(f"  center mean: {action_center.mean().item():.6f}")
     logging.info(f"  scale mean: {action_scale.mean().item():.6f}")
+    logging.info(f"  dataset_center mean: {dataset_center.mean().item():.6f}")
+    logging.info(f"  action_range mean: {action_range.mean().item():.6f}")
     logging.info("")
 
-    # Create agent's ItemEmbeddings with GeMS weights
-    agent_embeddings = ItemEmbeddings(
-        num_items=ranker.num_items,
-        item_embedd_dim=config.item_embedd_dim,
-        device=config.device,
-        weights=gems_embedding_weights
-    )
+    # 🔥 agent_embeddings already created by RankerFactory
+    # No need to create again - it's returned from factory
 
     # Freeze embeddings
     for param in agent_embeddings.parameters():
@@ -922,6 +1159,8 @@ def train_iql(config: IQLConfig):
         'item_embeddings': agent_embeddings,
         'action_center': action_center,
         'action_scale': action_scale,
+        'dataset_center': dataset_center,  # 🔥 NEW: for global probe
+        'action_range': action_range,  # 🔥 NEW: for global probe
         'num_items': ranker.num_items,
         'item_embedd_dim': config.item_embedd_dim,
     }
@@ -945,7 +1184,8 @@ def train_iql(config: IQLConfig):
             dataset_quality=config.dataset_quality,
             device=config.device,
             seed=config.seed,
-            verbose=False
+            verbose=False,
+            dataset_path=config.dataset_path  # 🔥 NEW: for frequency probe
         )
         logging.info(f"✅ Evaluation environment initialized for {config.env_name}")
     except Exception as e:
@@ -969,147 +1209,217 @@ def train_iql(config: IQLConfig):
 
         # Logging
         if (t + 1) % config.log_freq == 0:
-            # 构建统一的 SwanLab 指标字典（带命名空间前缀）
+            # 🔥 计算诊断指标（合并到主日志）
+            diag_metrics = agent.compute_representation_diagnostics(batch)
+
+            # 🔥 构建分组的 SwanLab 指标字典（13个类别）
             swanlab_metrics = {
-                # Loss metrics
-                "train/actor_loss": metrics['actor_loss'],
-                "train/critic_loss": metrics['critic_loss'],
-                "train/value_loss": metrics['value_loss'],
+                # 1️⃣ Loss指标（3个）
+                "1_Loss/actor_loss": metrics['actor_loss'],
+                "1_Loss/critic_loss": metrics['critic_loss'],
+                "1_Loss/value_loss": metrics['value_loss'],
 
-                # V-value statistics (enhanced)
-                "train/v_value_mean": metrics['v_value_mean'],
-                "train/v_value_min": metrics['v_value_min'],
-                "train/v_value_max": metrics['v_value_max'],
-                "train/v_value_std": metrics['v_value_std'],
+                # 2️⃣ V-value统计（4个）
+                "2_V-value/mean": metrics['v_value_mean'],
+                "2_V-value/min": metrics['v_value_min'],
+                "2_V-value/max": metrics['v_value_max'],
+                "2_V-value/std": metrics['v_value_std'],
 
-                # Q-value statistics (enhanced)
-                "train/q_value_mean": metrics['q_value_mean'],
-                "train/q_value_min": metrics['q_value_min'],
-                "train/q_value_max": metrics['q_value_max'],
-                "train/q_value_std": metrics['q_value_std'],
-                "train/target_q_mean": metrics['target_q_mean'],
-                "train/target_q_min": metrics['target_q_min'],
-                "train/target_q_max": metrics['target_q_max'],
+                # 3️⃣ Q-value统计（7个）
+                "3_Q-value/mean": metrics['q_value_mean'],
+                "3_Q-value/min": metrics['q_value_min'],
+                "3_Q-value/max": metrics['q_value_max'],
+                "3_Q-value/std": metrics['q_value_std'],
+                "3_Q-value/target_mean": metrics['target_q_mean'],
+                "3_Q-value/target_min": metrics['target_q_min'],
+                "3_Q-value/target_max": metrics['target_q_max'],
 
-                # TD error
-                "train/td_error": metrics['td_error'],
+                # 4️⃣ TD Error（1个）
+                "4_TD-Error/td_error": metrics['td_error'],
 
-                # Advantage statistics
-                "train/advantage_mean": metrics['advantage_mean'],
-                "train/advantage_std": metrics['advantage_std'],
+                # 5️⃣ Advantage统计（4个）
+                "5_Advantage/mean": metrics['advantage_mean'],
+                "5_Advantage/std": metrics['advantage_std'],
+                "5_Advantage/max": metrics['advantage_max'],
+                "5_Advantage/min": metrics['advantage_min'],
 
-                # 🔍 FORENSIC LEVEL 0: Input & Target Health
-                "train/s_actor_has_nan": metrics['s_actor_has_nan'],
-                "train/s_actor_has_inf": metrics['s_actor_has_inf'],
-                "train/s_actor_min": metrics['s_actor_min'],
-                "train/s_actor_max": metrics['s_actor_max'],
-                "train/true_actions_has_nan": metrics['true_actions_has_nan'],
-                "train/true_actions_has_inf": metrics['true_actions_has_inf'],
-                "train/true_actions_min": metrics['true_actions_min'],
-                "train/true_actions_max": metrics['true_actions_max'],
+                # 6️⃣ 输入健康检查（8个）
+                "6_Input-Health/s_actor_has_nan": metrics['s_actor_has_nan'],
+                "6_Input-Health/s_actor_has_inf": metrics['s_actor_has_inf'],
+                "6_Input-Health/s_actor_min": metrics['s_actor_min'],
+                "6_Input-Health/s_actor_max": metrics['s_actor_max'],
+                "6_Input-Health/true_actions_has_nan": metrics['true_actions_has_nan'],
+                "6_Input-Health/true_actions_has_inf": metrics['true_actions_has_inf'],
+                "6_Input-Health/true_actions_min": metrics['true_actions_min'],
+                "6_Input-Health/true_actions_max": metrics['true_actions_max'],
 
-                # 🔍 FORENSIC LEVEL 1: Advantage Extremes
-                "train/advantage_max": metrics['advantage_max'],
-                "train/advantage_min": metrics['advantage_min'],
+                # 7️⃣ AWR权重（4个）
+                "7_AWR-Weight/before_clip_max": metrics['weight_before_clip_max'],
+                "7_AWR-Weight/before_clip_min": metrics['weight_before_clip_min'],
+                "7_AWR-Weight/max": metrics['weight_max'],
+                "7_AWR-Weight/mean": metrics['weight_mean'],
 
-                # 🔍 FORENSIC: Weight Explosion Monitor
-                "train/weight_before_clip_max": metrics['weight_before_clip_max'],
-                "train/weight_before_clip_min": metrics['weight_before_clip_min'],
-                "train/weight_max": metrics['weight_max'],
-                "train/weight_mean": metrics['weight_mean'],
+                # 8️⃣ 策略统计（9个 - added distance_to_origin）
+                "8_Policy/awr_weight_std": metrics['awr_weight_std'],
+                "8_Policy/entropy": metrics['policy_entropy'],
+                "8_Policy/mu_min": metrics['actor_mu_min'],
+                "8_Policy/mu_max": metrics['actor_mu_max'],
+                "8_Policy/mu_mean": metrics['actor_mu_mean'],
+                "8_Policy/distance_to_origin": metrics['policy_distance_to_origin'],  # 🔥 NEW: BC gravity evidence
+                "8_Policy/z_to_dataset_center_mean": metrics['z_to_dataset_center_mean'],
+                "8_Policy/z_to_boundary_mean": metrics['z_to_boundary_mean'],
+                "8_Policy/tanh_saturation_ratio": metrics['tanh_saturation_ratio'],
+                "8_Policy/mu_iqr": metrics['mu_iqr'],
+                "8_Policy/max_per_dim_floor_hit": metrics['max_per_dim_floor_hit'],
+                "8_Policy/mean_per_dim_floor_hit": metrics['mean_per_dim_floor_hit'],
+                "8_Policy/num_dims_with_high_floor_hit": metrics['num_dims_with_high_floor_hit'],
+                "8_Policy/raw_log_std_min": metrics['actor_log_std_raw_min'],
+                "8_Policy/raw_log_std_mean": metrics['actor_log_std_raw_mean'],
+                "8_Policy/raw_log_std_max": metrics['actor_log_std_raw_max'],
+                "8_Policy/log_std_min": metrics['actor_log_std_min'],
+                "8_Policy/log_std_mean": metrics['actor_log_std_mean'],
+                "8_Policy/log_std_max": metrics['actor_log_std_max'],
+                "8_Policy/log_std_floor_hit_rate": metrics['actor_log_std_floor_hit_rate'],
+                "8_Policy/log_std_ceiling_hit_rate": metrics['actor_log_std_ceiling_hit_rate'],
+                "8_Policy/ood_distance_mean_det": metrics['ood_distance_mean_det'],
+                "8_Policy/ood_distance_max_det": metrics['ood_distance_max_det'],
+                "8_Policy/ood_distance_mean_samp": metrics['ood_distance_mean_samp'],
+                "8_Policy/ood_distance_max_samp": metrics['ood_distance_max_samp'],
 
-                # 🔥 NEW METRICS: AWR Weight Distribution & Policy Entropy
-                "train/awr_weight_std": metrics['awr_weight_std'],
-                "train/policy_entropy": metrics['policy_entropy'],
+                # 9️⃣ Jacobian项（4个）
+                "9_Jacobian/min": metrics['jacobian_term_min'],
+                "9_Jacobian/max": metrics['jacobian_term_max'],
+                "9_Jacobian/has_negative": metrics['jacobian_term_has_negative'],
+                "9_Jacobian/has_nan": metrics['jacobian_term_has_nan'],
 
-                # 🔍 FORENSIC: Policy Internal Diagnostics
-                "train/actor_mu_min": metrics['actor_mu_min'],
-                "train/actor_mu_max": metrics['actor_mu_max'],
-                "train/actor_mu_mean": metrics['actor_mu_mean'],
-                "train/actor_log_std_min": metrics['actor_log_std_min'],
-                "train/actor_log_std_mean": metrics['actor_log_std_mean'],
-                "train/actor_log_std_max": metrics['actor_log_std_max'],
+                # 🔟 Log概率（2个）
+                "10_LogProb/min_raw": metrics['log_prob_min_raw'],
+                "10_LogProb/max_raw": metrics['log_prob_max_raw'],
 
-                # 🔍 FORENSIC: Jacobian Term (1 - (action/max_action)^2)
-                "train/jacobian_term_min": metrics['jacobian_term_min'],
-                "train/jacobian_term_max": metrics['jacobian_term_max'],
-                "train/jacobian_term_has_negative": metrics['jacobian_term_has_negative'],
-                "train/jacobian_term_has_nan": metrics['jacobian_term_has_nan'],
+                # 1️⃣1️⃣ OOB监控（6个）
+                "11_OOB/count": metrics['oob_count'],
+                "11_OOB/rate": metrics['oob_rate'],
+                "11_OOB/atanh_protected_has_nan": metrics['atanh_protected_has_nan'],
+                "11_OOB/atanh_raw_has_nan": metrics['atanh_raw_has_nan'],
+                "11_OOB/atanh_raw_has_inf": metrics['atanh_raw_has_inf'],
+                "11_OOB/atanh_domain_violation_rate": metrics['atanh_domain_violation_rate'],
+                "11_OOB/true_action_abs_max": metrics['true_action_abs_max'],
+                "11_OOB/action_ratio_abs_max": metrics['action_ratio_abs_max'],
 
-                # 🔍 FORENSIC: Log Probability Stability
-                "train/log_prob_min_raw": metrics['log_prob_min_raw'],
-                "train/log_prob_max_raw": metrics['log_prob_max_raw'],
+                # 1️⃣2️⃣ 梯度范数（3个）
+                "12_Gradient/actor_norm": metrics['actor_grad_norm'],
+                "12_Gradient/critic_norm": metrics['critic_grad_norm'],
+                "12_Gradient/value_norm": metrics['value_grad_norm'],
 
-                # 🔥 CONVICTION METRICS: Quantitative Proof of OOB Problem
-                "train/oob_count": metrics['oob_count'],
-                "train/oob_rate": metrics['oob_rate'],
-                "train/atanh_protected_has_nan": metrics['atanh_protected_has_nan'],
-                "train/atanh_raw_has_nan": metrics['atanh_raw_has_nan'],
-                "train/true_action_abs_max": metrics['true_action_abs_max'],
-                "train/action_ratio_abs_max": metrics['action_ratio_abs_max'],
+                # 1️⃣3️⃣ 表示诊断（5个）
+                "13_Representation/actor_svd_rank": diag_metrics['actor_svd_rank'],
+                "13_Representation/critic_svd_rank": diag_metrics['critic_svd_rank'],
+                "13_Representation/actor_condition_number": diag_metrics['actor_condition_number'],
+                "13_Representation/critic_condition_number": diag_metrics['critic_condition_number'],
+                "13_Representation/consistency": diag_metrics['representation_consistency'],
 
-                # Gradient norms
-                "train/actor_grad_norm": metrics['actor_grad_norm'],
-                "train/critic_grad_norm": metrics['critic_grad_norm'],
-                "train/value_grad_norm": metrics['value_grad_norm'],
+                # 1️⃣4️⃣ 采样时序监控（1个）- 🔥 数据顺序效应探针
+                "Batch_Data/reward_mean": metrics['batch_reward_mean'],
             }
 
-            # 全量本地日志记录（与 SwanLab 完全一致）
-            log_parts = [f"Step {t+1}/{config.max_timesteps}:"]
-            for key, value in swanlab_metrics.items():
-                short_key = key.replace("train/", "")
-                log_parts.append(f"{short_key}={value:.6f}")
-            logging.info(", ".join(log_parts))
+            # 完整分类日志记录
+            progress_pct = (t + 1) / config.max_timesteps * 100
+            logging.info(f"[Training] Step {t+1}/{config.max_timesteps} ({progress_pct:.1f}%)")
+
+            # 1. Loss指标
+            logging.info(f"  [1] Loss: actor={metrics['actor_loss']:.6f}, critic={metrics['critic_loss']:.6f}, value={metrics['value_loss']:.6f}")
+
+            # 2. V-value统计
+            logging.info(f"  [2] V-value: mean={metrics['v_value_mean']:.6f}, min={metrics['v_value_min']:.6f}, max={metrics['v_value_max']:.6f}, std={metrics['v_value_std']:.6f}")
+
+            # 3. Q-value统计
+            logging.info(f"  [3] Q-value: mean={metrics['q_value_mean']:.6f}, min={metrics['q_value_min']:.6f}, max={metrics['q_value_max']:.6f}, std={metrics['q_value_std']:.6f}, target_mean={metrics['target_q_mean']:.6f}, target_min={metrics['target_q_min']:.6f}, target_max={metrics['target_q_max']:.6f}")
+
+            # 4. TD Error
+            logging.info(f"  [4] TD-Error: td_error={metrics['td_error']:.6f}")
+
+            # 5. Advantage统计
+            logging.info(f"  [5] Advantage: mean={metrics['advantage_mean']:.6f}, std={metrics['advantage_std']:.6f}, max={metrics['advantage_max']:.6f}, min={metrics['advantage_min']:.6f}")
+
+            # 6. 输入健康检查
+            logging.info(f"  [6] Input-Health: s_actor(nan={metrics['s_actor_has_nan']:.1f}, inf={metrics['s_actor_has_inf']:.1f}, min={metrics['s_actor_min']:.6f}, max={metrics['s_actor_max']:.6f}), true_actions(nan={metrics['true_actions_has_nan']:.1f}, inf={metrics['true_actions_has_inf']:.1f}, min={metrics['true_actions_min']:.6f}, max={metrics['true_actions_max']:.6f})")
+
+            # 7. AWR权重
+            logging.info(f"  [7] AWR-Weight: before_clip(max={metrics['weight_before_clip_max']:.6f}, min={metrics['weight_before_clip_min']:.6f}), max={metrics['weight_max']:.6f}, mean={metrics['weight_mean']:.6f}")
+
+            # 8. 策略统计（新增 z_center, z_boundary, tanh_sat, mu_iqr, per_dim_floor）
+            logging.info(
+                f"  [8] Policy: awr_weight_std={metrics['awr_weight_std']:.6f}, entropy={metrics['policy_entropy']:.6f}, "
+                f"mu(min={metrics['actor_mu_min']:.6f}, max={metrics['actor_mu_max']:.6f}, mean={metrics['actor_mu_mean']:.6f}), "
+                f"z_center={metrics['z_to_dataset_center_mean']:.4f}, z_boundary={metrics['z_to_boundary_mean']:.4f}, "
+                f"tanh_sat={metrics['tanh_saturation_ratio']:.4f}, mu_iqr={metrics['mu_iqr']:.4f}, "
+                f"per_dim_floor(max={metrics['max_per_dim_floor_hit']:.4f}, mean={metrics['mean_per_dim_floor_hit']:.4f}, dims>0.5={int(metrics['num_dims_with_high_floor_hit'])}), "
+                f"log_std_raw(min={metrics['actor_log_std_raw_min']:.6f}, mean={metrics['actor_log_std_raw_mean']:.6f}, max={metrics['actor_log_std_raw_max']:.6f}), "
+                f"log_std_clamped(min={metrics['actor_log_std_min']:.6f}, mean={metrics['actor_log_std_mean']:.6f}, max={metrics['actor_log_std_max']:.6f}, "
+                f"floor_hit={metrics['actor_log_std_floor_hit_rate']:.4f}, ceil_hit={metrics['actor_log_std_ceiling_hit_rate']:.4f}), "
+                f"ood_det(mean={metrics['ood_distance_mean_det']:.4f}, max={metrics['ood_distance_max_det']:.4f}), "
+                f"ood_samp(mean={metrics['ood_distance_mean_samp']:.4f}, max={metrics['ood_distance_max_samp']:.4f})"
+            )
+
+            # 9. Jacobian项
+            logging.info(f"  [9] Jacobian: min={metrics['jacobian_term_min']:.6f}, max={metrics['jacobian_term_max']:.6f}, has_negative={metrics['jacobian_term_has_negative']:.1f}, has_nan={metrics['jacobian_term_has_nan']:.1f}")
+
+            # 10. Log概率
+            logging.info(f"  [10] LogProb: min_raw={metrics['log_prob_min_raw']:.6f}, max_raw={metrics['log_prob_max_raw']:.6f}")
+
+            # 11. OOB监控
+            logging.info(f"  [11] OOB: count={metrics['oob_count']:.1f}, rate={metrics['oob_rate']:.6f}, atanh_protected_nan={metrics['atanh_protected_has_nan']:.1f}, atanh_raw_nan={metrics['atanh_raw_has_nan']:.1f}, atanh_raw_inf={metrics['atanh_raw_has_inf']:.1f}, domain_violation_rate={metrics['atanh_domain_violation_rate']:.6f}, true_action_abs_max={metrics['true_action_abs_max']:.6f}, action_ratio_abs_max={metrics['action_ratio_abs_max']:.6f}")
+
+            # 12. 梯度范数
+            logging.info(f"  [12] Gradient: actor_norm={metrics['actor_grad_norm']:.6f}, critic_norm={metrics['critic_grad_norm']:.6f}, value_norm={metrics['value_grad_norm']:.6f}")
+
+            # 13. 表示诊断
+            logging.info(f"  [13] Representation: actor_svd_rank={diag_metrics['actor_svd_rank']:.1f}, critic_svd_rank={diag_metrics['critic_svd_rank']:.1f}, actor_condition={diag_metrics['actor_condition_number']:.6f}, critic_condition={diag_metrics['critic_condition_number']:.6f}, consistency={diag_metrics['representation_consistency']:.6f}")
+            logging.info("")  # 空行分隔
 
             if swan_logger:
                 swan_logger.log_metrics(swanlab_metrics, step=t+1)
 
-        # 🔥 Representation Diagnostics (every 100 steps)
-        if (t + 1) % 100 == 0:
-            diag_metrics = agent.compute_representation_diagnostics(batch)
-
-            diag_log_parts = [f"[Diagnostics @ Step {t+1}]"]
-            diag_log_parts.append(f"actor_rank={diag_metrics['actor_svd_rank']:.2f}/{config.belief_hidden_dim}")
-            diag_log_parts.append(f"critic_rank={diag_metrics['critic_svd_rank']:.2f}/{config.belief_hidden_dim}")
-            diag_log_parts.append(f"actor_cond={diag_metrics['actor_condition_number']:.2f}")
-            diag_log_parts.append(f"critic_cond={diag_metrics['critic_condition_number']:.2f}")
-            diag_log_parts.append(f"repr_consistency={diag_metrics['representation_consistency']:.4f}")
-            logging.info(", ".join(diag_log_parts))
-
-            if swan_logger:
-                swan_logger.log_metrics({
-                    "diagnostics/actor_svd_rank": diag_metrics['actor_svd_rank'],
-                    "diagnostics/critic_svd_rank": diag_metrics['critic_svd_rank'],
-                    "diagnostics/actor_condition_number": diag_metrics['actor_condition_number'],
-                    "diagnostics/critic_condition_number": diag_metrics['critic_condition_number'],
-                    "diagnostics/representation_consistency": diag_metrics['representation_consistency'],
-                }, step=t+1)
-
         # Evaluation
         if eval_env is not None and (t + 1) % config.eval_freq == 0:
-            logging.info(f"\n{'='*80}")
-            logging.info(f"Evaluating at step {t+1}")
-            logging.info(f"{'='*80}")
-
             eval_metrics = eval_env.evaluate_policy(
                 agent=agent,
-                num_episodes=10,
+                num_episodes=config.eval_episodes,
                 deterministic=True
             )
 
-            log_msg = (f"Evaluation: mean_reward={eval_metrics['mean_reward']:.2f} ± "
-                      f"{eval_metrics['std_reward']:.2f}")
-            logging.info(log_msg)
+            # 简洁的 Evaluation 日志
+            logging.info(f"[Evaluation] Step {t+1}/{config.max_timesteps}")
+            logging.info(
+                f"  Mean Reward: {eval_metrics['mean_reward']:.2f} ± {eval_metrics['std_reward']:.2f} "
+                f"(min={eval_metrics.get('min_reward', 0):.2f}, max={eval_metrics.get('max_reward', 0):.2f})"
+            )
+            logging.info(
+                f"  Median Reward: {eval_metrics.get('median_reward', 0.0):.2f} | "
+                f"IQM: {eval_metrics.get('iqm_reward', eval_metrics['mean_reward']):.2f}"
+            )
+            logging.info(f"  Episode Length: {eval_metrics['mean_episode_length']:.1f}")
+            logging.info("")  # 空行分隔
 
             if swan_logger:
                 swan_logger.log_metrics({
                     'eval/mean_reward': eval_metrics['mean_reward'],
                     'eval/std_reward': eval_metrics['std_reward'],
+                    'eval/median_reward': eval_metrics.get('median_reward', eval_metrics['mean_reward']),
+                    'eval/iqm_reward': eval_metrics.get('iqm_reward', eval_metrics['mean_reward']),
                     'eval/mean_episode_length': eval_metrics['mean_episode_length'],
+                    # 🔥 Add early termination rate for Boredom evidence
+                    'eval/early_termination_rate': eval_metrics.get('early_termination_rate', 0.0),
                 }, step=t+1)
 
             # 🔥 NEW: Save best checkpoint
-            current_reward = eval_metrics['mean_reward']
+            best_metric_name = getattr(config, "best_checkpoint_metric", "iqm")
+            if best_metric_name == "iqm":
+                current_reward = eval_metrics.get('iqm_reward', eval_metrics['mean_reward'])
+            elif best_metric_name == "median":
+                current_reward = eval_metrics.get('median_reward', eval_metrics['mean_reward'])
+            else:
+                current_reward = eval_metrics['mean_reward']
             if current_reward > best_eval_reward:
                 best_eval_reward = current_reward
                 best_checkpoint_path = os.path.join(
@@ -1117,8 +1427,85 @@ def train_iql(config: IQLConfig):
                     f"iql_{config.env_name}_{config.dataset_quality}_tau{config.tau}_beta{config.beta}_seed{config.seed}_{config.run_id}_best.pt"
                 )
                 agent.save(best_checkpoint_path)
-                logging.info(f"🏆 New best model saved! Reward: {best_eval_reward:.2f} at step {t+1}")
+                logging.info(
+                    f"🏆 New best model saved! {best_metric_name}={best_eval_reward:.2f} at step {t+1}"
+                )
                 logging.info(f"   Checkpoint: {best_checkpoint_path}")
+
+                # 🔥 NEW: 自动触发Ranker蝴蝶效应测试（Perturbation Sensitivity Test）
+                if config.enable_perturbation_test:
+                    import json
+                    logging.info("")
+                    logging.info("=" * 80)
+                    logging.info("🔬 Triggering Perturbation Sensitivity Test (Ranker Butterfly Effect)")
+                    logging.info("=" * 80)
+                    logging.info(f"Baseline IQM: {best_eval_reward:.2f}")
+                    logging.info(f"Testing noise levels: {config.perturbation_sigmas}")
+                    logging.info("")
+
+                    perturbation_results = {}
+                    for sigma in config.perturbation_sigmas:
+                        logging.info(f"📊 Testing σ={sigma}...")
+
+                        # 运行加噪评估
+                        perturbed_metrics = eval_env.evaluate_policy(
+                            agent=agent,
+                            num_episodes=config.perturbation_episodes,
+                            deterministic=True,
+                            noise_sigma=sigma,
+                            return_hamming_stats=True
+                        )
+
+                        # 计算对比指标
+                        baseline_iqm = best_eval_reward
+                        perturbed_iqm = perturbed_metrics['iqm_reward']
+                        reward_drop_pct = (baseline_iqm - perturbed_iqm) / baseline_iqm * 100 if baseline_iqm > 0 else 0.0
+                        hamming_dist = perturbed_metrics.get('hamming_distance_mean', 0.0)
+                        hamming_std = perturbed_metrics.get('hamming_distance_std', 0.0)
+                        early_term_rate = perturbed_metrics.get('early_termination_rate', 0.0)
+
+                        perturbation_results[f"sigma_{sigma}"] = {
+                            'iqm_reward': float(perturbed_iqm),
+                            'reward_drop_pct': float(reward_drop_pct),
+                            'hamming_distance_mean': float(hamming_dist),
+                            'hamming_distance_std': float(hamming_std),
+                            'early_termination_rate': float(early_term_rate),
+                        }
+
+                        logging.info(f"  IQM: {baseline_iqm:.2f} → {perturbed_iqm:.2f} (↓{reward_drop_pct:.1f}%)")
+                        logging.info(f"  Hamming Distance: {hamming_dist:.3f} ± {hamming_std:.3f} ({hamming_dist*10:.1f} items changed)")
+                        logging.info(f"  Early Termination Rate: {early_term_rate:.1%}")
+                        logging.info("")
+
+                    # 保存结果到JSON（专门的motivation_test目录）
+                    # 🔥 NEW: 保存到专门的动机实验目录
+                    motivation_json_dir = "/data/liyuefeng/offline-slate-rl/motivation_test/json/perturbation_butterfly_effect"
+                    os.makedirs(motivation_json_dir, exist_ok=True)
+
+                    json_filename = f"perturbation_tau{config.tau}_beta{config.beta}_seed{config.seed}_{config.run_id}_step{t+1}.json"
+                    perturbation_log_path = os.path.join(motivation_json_dir, json_filename)
+
+                    perturbation_data = {
+                        'step': t+1,
+                        'baseline_iqm': float(baseline_iqm),
+                        'config': {
+                            'tau': config.tau,
+                            'beta': config.beta,
+                            'seed': config.seed,
+                            'ranker_type': config.ranker_type,
+                            'lambda_bc': config.lambda_bc,
+                            'experiment_tag': config.experiment_tag,
+                        },
+                        'results': perturbation_results
+                    }
+
+                    with open(perturbation_log_path, 'w') as f:
+                        json.dump(perturbation_data, f, indent=2)
+
+                    logging.info(f"✅ Perturbation test completed! Results saved to:")
+                    logging.info(f"   {perturbation_log_path}")
+                    logging.info("=" * 80)
+                    logging.info("")
 
         # Save checkpoint
         if (t + 1) % config.save_freq == 0:
@@ -1143,19 +1530,27 @@ def train_iql(config: IQLConfig):
 
         final_eval_metrics = eval_env.evaluate_policy(
             agent=agent,
-            num_episodes=100,
+            num_episodes=config.final_eval_episodes,
             deterministic=True
         )
 
         logging.info(f"Final Results:")
         logging.info(f"  Mean Reward: {final_eval_metrics['mean_reward']:.2f} ± {final_eval_metrics['std_reward']:.2f}")
+        logging.info(
+            f"  Median Reward: {final_eval_metrics.get('median_reward', 0.0):.2f} | "
+            f"IQM: {final_eval_metrics.get('iqm_reward', final_eval_metrics['mean_reward']):.2f}"
+        )
         logging.info(f"  Mean Episode Length: {final_eval_metrics['mean_episode_length']:.2f}")
 
         if swan_logger:
             swan_logger.log_metrics({
                 'final_eval/mean_reward': final_eval_metrics['mean_reward'],
                 'final_eval/std_reward': final_eval_metrics['std_reward'],
+                'final_eval/median_reward': final_eval_metrics.get('median_reward', final_eval_metrics['mean_reward']),
+                'final_eval/iqm_reward': final_eval_metrics.get('iqm_reward', final_eval_metrics['mean_reward']),
                 'final_eval/mean_episode_length': final_eval_metrics['mean_episode_length'],
+                # 🔥 Add early termination rate for Boredom evidence
+                'final_eval/early_termination_rate': final_eval_metrics.get('early_termination_rate', 0.0),
             }, step=config.max_timesteps)
 
     logging.info(f"\n{'='*80}")
@@ -1174,6 +1569,8 @@ if __name__ == "__main__":
     # Experiment configuration
     parser.add_argument("--experiment_name", type=str, default="baseline_experiment",
                         help="实验名称")
+    parser.add_argument("--experiment_tag", type=str, default="",
+                        help="实验标签 (用于 swanlab 实验名称，如 'exp05_beta3')")
     parser.add_argument("--env_name", type=str, default="diffuse_mix",
                         help="环境名称")
     parser.add_argument("--dataset_quality", type=str, default="expert",
@@ -1196,6 +1593,13 @@ if __name__ == "__main__":
                         help="批次大小")
     parser.add_argument("--eval_freq", type=int, default=500,
                         help="评估频率 (训练步数)")
+    parser.add_argument("--eval_episodes", type=int, default=50,
+                        help="每次评估回合数")
+    parser.add_argument("--final_eval_episodes", type=int, default=100,
+                        help="最终评估回合数")
+    parser.add_argument("--best_checkpoint_metric", type=str, default="iqm",
+                        choices=["mean", "median", "iqm"],
+                        help="保存best checkpoint使用的评估指标")
     parser.add_argument("--save_freq", type=int, default=int(5e4),
                         help="保存频率 (训练步数)")
     parser.add_argument("--log_freq", type=int, default=1000,
@@ -1214,6 +1618,13 @@ if __name__ == "__main__":
                         help="Actor learning rate")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="Discount factor")
+    parser.add_argument("--reward_scale", type=float, default=100.0,
+                        help="Reward scaling factor (reward / reward_scale)")
+    parser.add_argument("--actor_type", type=str, default="gaussian",
+                        choices=["gaussian", "deterministic", "fixed_gaussian"],
+                        help="Actor architecture type: gaussian (learnable std), deterministic (no std), fixed_gaussian (fixed std)")
+    parser.add_argument("--fixed_std", type=float, default=0.1,
+                        help="Fixed standard deviation for fixed_gaussian actor")
     parser.add_argument("--tau", type=float, default=0.005,
                         help="Target network update rate")
 
@@ -1223,16 +1634,60 @@ if __name__ == "__main__":
     parser.add_argument("--n_hidden", type=int, default=2,
                         help="隐藏层数量")
 
+    # 🔥 Ranker & Agent configuration (解耦架构)
+    parser.add_argument("--ranker", type=str, default="gems",
+                        choices=["gems", "topk", "kheadargmax", "wolpertinger", "wolpertinger_slate", "greedy"],
+                        help="Ranker类型: gems, topk, kheadargmax, wolpertinger, wolpertinger_slate, greedy")
+    parser.add_argument("--agent", type=str, default="iql",
+                        choices=["iql", "td3bc", "cql"],
+                        help="Agent类型 (为未来扩展准备)")
+
+    # 🔥 Wolpertinger Ranker 参数
+    parser.add_argument("--wolpertinger_k", type=int, default=50,
+                        help="Wolpertinger kNN 候选数量")
+    parser.add_argument("--wolpertinger_hidden_dims", type=int, nargs='+', default=[256, 128],
+                        help="Wolpertinger Actor 隐层维度")
+
+    # 🔥 GreedySlateRanker 参数
+    parser.add_argument("--greedy_s_no_click", type=float, default=-1.0,
+                        help="GreedySlateRanker 无点击基准分数")
+
+    # BC Loss & Entropy 正则化
+    parser.add_argument("--lambda_bc", type=float, default=0.5,
+                        help="BC Loss 权重，0=纯 AWR，1=AWR+BC 等权")
+    parser.add_argument("--entropy_alpha", type=float, default=0.01,
+                        help="熵正则化系数（暂未启用，预留接口）")
+    parser.add_argument("--label_click_mode", type=str, default="fake_zero",
+                        choices=["fake_zero", "real"],
+                        help="动作标签推断click模式: fake_zero(全0点击) 或 real(真实点击)")
+
+    # 🔥 Perturbation Sensitivity Test (Ranker Butterfly Effect Experiment)
+    parser.add_argument("--enable_perturbation_test", action="store_true",
+                        help="是否在达到Best IQM时自动触发Ranker加噪敏感性测试")
+    parser.add_argument("--perturbation_episodes", type=int, default=50,
+                        help="加噪测试的评估轮数")
+
     # SwanLab configuration
     parser.add_argument("--use_swanlab", action="store_true", default=True,
                         help="是否使用SwanLab")
     parser.add_argument("--no_swanlab", action="store_false", dest="use_swanlab",
                         help="禁用SwanLab")
+    # 🔥 Add SwanLab project configuration arguments
+    parser.add_argument("--swan_project", type=str, default="Offline_Slate_RL_202603",
+                        help="SwanLab项目名称")
+    parser.add_argument("--swan_workspace", type=str, default="Cliff",
+                        help="SwanLab工作空间")
+    parser.add_argument("--swan_mode", type=str, default="cloud",
+                        choices=["cloud", "local", "offline"],
+                        help="SwanLab运行模式")
+    parser.add_argument("--swan_logdir", type=str, default="experiments/swanlog",
+                        help="SwanLab本地日志目录")
 
     args = parser.parse_args()
 
     config = IQLConfig(
         experiment_name=args.experiment_name,
+        experiment_tag=args.experiment_tag,
         env_name=args.env_name,
         dataset_quality=args.dataset_quality,
         seed=args.seed,
@@ -1242,6 +1697,8 @@ if __name__ == "__main__":
         max_timesteps=args.max_timesteps,
         batch_size=args.batch_size,
         eval_freq=args.eval_freq,
+        eval_episodes=args.eval_episodes,
+        final_eval_episodes=args.final_eval_episodes,
         save_freq=args.save_freq,
         log_freq=args.log_freq,
         tau=args.expectile,  # Expectile parameter (CLI: --expectile, Config: tau)
@@ -1250,11 +1707,31 @@ if __name__ == "__main__":
         critic_lr=args.critic_lr,
         actor_lr=args.actor_lr,
         gamma=args.gamma,
+        reward_scale=args.reward_scale,  # 🔥 NEW: Reward scaling factor
         iql_tau=args.tau,  # Soft update tau (CLI: --tau, Config: iql_tau)
         hidden_dim=args.hidden_dim,
         n_hidden=args.n_hidden,
         use_swanlab=args.use_swanlab,
+        # 🔥 SwanLab configuration from CLI
+        swan_project=args.swan_project,
+        swan_workspace=args.swan_workspace,
+        swan_mode=args.swan_mode,
+        swan_logdir=args.swan_logdir,
+        ranker_type=args.ranker,  # 🔥 NEW: Ranker selection
+        agent_type=args.agent,    # 🔥 NEW: Agent selection
+        wolpertinger_k=args.wolpertinger_k,  # 🔥 NEW: Wolpertinger kNN k
+        wolpertinger_hidden_dims=args.wolpertinger_hidden_dims,  # 🔥 NEW: Wolpertinger Actor hidden dims
+        greedy_s_no_click=args.greedy_s_no_click,  # 🔥 NEW: Greedy s_no_click
+        lambda_bc=args.lambda_bc,
+        entropy_alpha=args.entropy_alpha,
+        label_click_mode=args.label_click_mode,
+        # 🔥 NEW: Perturbation Test
+        enable_perturbation_test=args.enable_perturbation_test,
+        perturbation_episodes=args.perturbation_episodes,
+        # 🔥 NEW: Actor Architecture Ablation
+        actor_type=args.actor_type,
+        fixed_std=args.fixed_std,
     )
+    config.best_checkpoint_metric = args.best_checkpoint_metric
 
     train_iql(config)
-

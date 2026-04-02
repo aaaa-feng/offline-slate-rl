@@ -29,8 +29,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # 导入路径配置
 sys.path.insert(0, str(PROJECT_ROOT.parent))
-from config import paths
-from config.offline_config import TD3BCConfig, auto_generate_paths, auto_generate_swanlab_config
+from config.offline import paths
+from config.offline.config import TD3BCConfig, auto_generate_paths, auto_generate_swanlab_config
 
 from common.offline.buffer import ReplayBuffer, TrajectoryReplayBuffer
 from common.offline.utils import set_seed, compute_mean_std, soft_update

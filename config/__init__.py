@@ -7,27 +7,21 @@ Config模块统一导出接口
 目录结构:
 - online/: 在线RL训练配置（历史参考，YAML格式）
 - offline/: 离线RL训练配置（Python dataclass）
-- paths.py: 全局路径管理
-- env_params.py: 环境参数加载器（旧版本，保留兼容性）
-- offline_config.py: 离线算法配置（旧版本，保留兼容性）
+  - paths.py: 全局路径管理
+  - env_params.py: 环境参数加载器
+  - config.py: 离线算法配置
 
 使用方式:
-    # 方式1：直接从config导入（推荐）
-    from config import paths, BCConfig, get_env_config
-
-    # 方式2：从子模块导入（新代码推荐）
-    from config.offline.algorithms import BCConfig
-    from config.offline.env_loader import get_env_config
-
-    # 方式3：从旧路径导入（向后兼容）
-    from config.offline_config import BCConfig
-    from config.env_params import get_env_config
+    # 推荐方式：从offline子模块导入
+    from config.offline import paths
+    from config.offline.config import IQLConfig
+    from config.offline.env_params import get_env_config
 """
 
 # ============================================================================
 # 路径管理（全局通用）
 # ============================================================================
-from .paths import (
+from .offline.paths import (
     # 主要目录
     PROJECT_ROOT,
     CONFIG_DIR,
@@ -77,7 +71,7 @@ from .paths import (
 # ============================================================================
 # 离线RL算法配置
 # ============================================================================
-from .offline_config import (
+from .offline.config import (
     # 配置类
     BaseOfflineConfig,
     BCConfig,
@@ -94,7 +88,7 @@ from .offline_config import (
 # ============================================================================
 # 环境参数加载器
 # ============================================================================
-from .env_params import (
+from .offline.env_params import (
     # 主要函数
     get_env_config,
     list_available_envs,

@@ -10,8 +10,11 @@ import os
 # 项目根目录（自动检测）
 # ============================================================================
 
-# config/ 目录（本文件所在位置的父目录）
-CONFIG_DIR = Path(__file__).resolve().parent
+# config/offline/ 目录（本文件所在位置）
+CONFIG_OFFLINE_DIR = Path(__file__).resolve().parent
+
+# config/ 目录（config/offline/ 的父目录）
+CONFIG_DIR = CONFIG_OFFLINE_DIR.parent
 
 # 项目根目录（config/ 的父目录）
 PROJECT_ROOT = CONFIG_DIR.parent

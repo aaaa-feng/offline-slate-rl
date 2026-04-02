@@ -1,6 +1,6 @@
 """
 Behavior Cloning (BC) for GeMS datasets
-最简单的离线 RL baseline,用于验证数据加载和归一化
+最简单的离线 RL baseline，用于验证数据加载和归一化
 """
 import os
 import sys
@@ -18,15 +18,17 @@ import torch.nn.functional as F
 # 添加项目路径
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-
-# 导入路径配置
 sys.path.insert(0, str(PROJECT_ROOT.parent))
-from config import paths
-from config.offline_config import BCConfig, auto_generate_paths, auto_generate_swanlab_config
+from config.offline import paths
+from config.offline.config import BCConfig, auto_generate_paths, auto_generate_swanlab_config
 
 from common.offline.buffer import ReplayBuffer, TrajectoryReplayBuffer
 from common.offline.utils import set_seed, compute_mean_std
-from common.offline.networks import Actor
+from common.offline.networks import (
+    TanhGaussianActor,
+    LOG_STD_MIN,
+    LOG_STD_MAX,
+)
 from common.offline.eval_env import OfflineEvalEnv
 from common.offline.checkpoint_utils import resolve_gems_checkpoint
 from belief_encoders.gru_belief import GRUBelief
@@ -104,13 +106,15 @@ class BCAgent:
             self.belief.item_embeddings[module].freeze()
         logging.info("✅ Item embeddings frozen (double-checked)")
 
-        # 5. Actor network
-        self.actor = Actor(
+        # 5. Actor network - 使用与 IQL 相同的 TanhGaussianActor
+        self.actor = TanhGaussianActor(
             state_dim=config.belief_hidden_dim,
             action_dim=action_dim,
-            max_action=1.0,  # 输出 [-1, 1]，后续会用 action_scale 反归一化
-            hidden_dim=config.hidden_dim
+            max_action=1.0,
+            hidden_dim=config.hidden_dim,
+            n_hidden=2,
         ).to(self.device)
+        logging.info("✅ Using TanhGaussianActor (same as IQL)")
 
         # 6. Optimizer（只包含 GRU 和 Actor，不包含 Embeddings）
         self.optimizer = torch.optim.Adam([
@@ -143,15 +147,15 @@ class BCAgent:
             # Normalize actions
             true_actions = (true_actions - self.action_center) / self.action_scale
 
-        # Actor prediction
-        pred_actions = self.actor(state)  # [sum_seq_lens, action_dim]
-
-        # BC Loss (MSE)
-        loss = F.mse_loss(pred_actions, true_actions)
+        # ========================================================================
+        # 🔥 BC Loss: 负对数似然 (Negative Log Likelihood)
+        # ========================================================================
+        log_prob = self.actor.log_prob(state, true_actions)
+        bc_loss = -log_prob.mean()
 
         # 反向传播 (同时更新 GRU 和 Actor)
         self.optimizer.zero_grad()
-        loss.backward()
+        bc_loss.backward()
 
         # 计算梯度范数（用于监控）
         actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), float('inf'))
@@ -159,29 +163,97 @@ class BCAgent:
 
         self.optimizer.step()
 
+        # ========================================================================
+        # 🔥 "死亡探头"：核心诊断指标（与 IQL 对齐）
+        # ========================================================================
+        with torch.no_grad():
+            # 🔥 采样时序监控：batch 平均 reward
+            if batch.rewards is not None:
+                batch_reward_mean = torch.cat(batch.rewards, dim=0).mean().item()
+            else:
+                batch_reward_mean = 0.0
+
+            # 1. 获取 Actor 内部状态
+            hidden = self.actor.trunk(state)
+            actor_mu = self.actor.mu(hidden)
+            actor_log_std_raw = self.actor.log_std(hidden)
+            actor_log_std = torch.clamp(actor_log_std_raw, min=LOG_STD_MIN, max=LOG_STD_MAX)
+
+            # 2. Log Std 统计
+            actor_log_std_raw_min = actor_log_std_raw.min().item()
+            actor_log_std_raw_mean = actor_log_std_raw.mean().item()
+            actor_log_std_raw_max = actor_log_std_raw.max().item()
+            actor_log_std_min = actor_log_std.min().item()
+            actor_log_std_mean = actor_log_std.mean().item()
+            actor_log_std_max = actor_log_std.max().item()
+            actor_log_std_floor_hit_rate = (actor_log_std_raw <= LOG_STD_MIN).float().mean().item()
+
+            # 3. Tanh 饱和率
+            mu_after_tanh = torch.tanh(actor_mu)
+            tanh_saturation_ratio = (mu_after_tanh.abs() > 0.95).float().mean().item()
+
+            # 4. Policy Distance to Origin (BC 重力证据)
+            policy_distance_to_origin = torch.norm(actor_mu, dim=-1).mean().item()
+
+            # 5. Policy Entropy
+            policy_entropy = -log_prob.mean().item()
+
+            # 6. Action 统计（确定性输出）
+            pred_actions_deterministic = self.actor(state, deterministic=True)[0]
+
+            # 🔥 OOD Distance Probe: Actor 输出与数据集真实动作的距离
+            ood_distances_det = torch.norm(pred_actions_deterministic - true_actions, dim=-1)
+            ood_distance_mean_det = ood_distances_det.mean().item()
+            ood_distance_max_det = ood_distances_det.max().item()
+
+            # 采样动作的 OOD 距离
+            pred_actions_samp, _ = self.actor(state, deterministic=False)
+            ood_distances_samp = torch.norm(pred_actions_samp - true_actions, dim=-1)
+            ood_distance_mean_samp = ood_distances_samp.mean().item()
+            ood_distance_max_samp = ood_distances_samp.max().item()
+
         return {
-            "bc_loss": loss.item(),
-            "action_mean": pred_actions.mean().item(),
-            "action_std": pred_actions.std().item(),
-            "action_min": pred_actions.min().item(),
-            "action_max": pred_actions.max().item(),
+            # 基础指标
+            "bc_loss": bc_loss.item(),
+            "action_mean": pred_actions_deterministic.mean().item(),
+            "action_std": pred_actions_deterministic.std().item(),
+            "action_min": pred_actions_deterministic.min().item(),
+            "action_max": pred_actions_deterministic.max().item(),
             "target_action_mean": true_actions.mean().item(),
             "target_action_std": true_actions.std().item(),
             "actor_grad_norm": actor_grad_norm.item(),
             "gru_grad_norm": gru_grad_norm.item(),
+            # 🔥 "死亡探头"：核心诊断指标
+            "actor_log_std_raw_min": actor_log_std_raw_min,
+            "actor_log_std_raw_mean": actor_log_std_raw_mean,
+            "actor_log_std_raw_max": actor_log_std_raw_max,
+            "actor_log_std_min": actor_log_std_min,
+            "actor_log_std_mean": actor_log_std_mean,
+            "actor_log_std_max": actor_log_std_max,
+            "actor_log_std_floor_hit_rate": actor_log_std_floor_hit_rate,
+            "tanh_saturation_ratio": tanh_saturation_ratio,
+            "policy_distance_to_origin": policy_distance_to_origin,
+            "policy_entropy": policy_entropy,
+            # 🔥 OOD Distance Probe
+            "ood_distance_mean_det": ood_distance_mean_det,
+            "ood_distance_max_det": ood_distance_max_det,
+            "ood_distance_mean_samp": ood_distance_mean_samp,
+            "ood_distance_max_samp": ood_distance_max_samp,
+            # 🔥 采样时序监控探针
+            "batch_reward_mean": batch_reward_mean,
         }
 
     @torch.no_grad()
     def act(self, obs: Dict[str, Any], deterministic: bool = True) -> np.ndarray:
         """
-        选择动作 (使用 GRU 编码 + Actor 预测 + 反归一化)
+        Select action using Actor GRU and decode to slate.
 
         Args:
             obs: Dict with 'slate' and 'clicks' (torch.Tensor or numpy arrays)
-            deterministic: 是否确定性选择 (BC总是确定性的)
+            deterministic: 是否确定性选择 (BC 总是确定性的)
 
         Returns:
-            action: 反归一化后的动作
+            slate: numpy array of shape [rec_size] containing item IDs
         """
         # 统一转为 Tensor (无 Batch 维度)
         slate = torch.as_tensor(obs["slate"], dtype=torch.long, device=self.device)
@@ -190,17 +262,37 @@ class BCAgent:
         # 构造输入 (不加 unsqueeze(0)!)
         obs_tensor = {"slate": slate, "clicks": clicks}
 
-        # GRU编码
+        # GRU 编码
         belief_state = self.belief.forward(obs_tensor, done=False)["actor"]
 
-        # Actor预测
-        raw_action = self.actor(belief_state)
+        # 🔥 FIX: Actor 预测 - TanhGaussianActor 返回 (action, log_prob) 元组
+        # 必须传入 deterministic 标志并提取第一个元素 action
+        raw_action, _ = self.actor(belief_state, deterministic=deterministic, need_log_prob=False)
 
         # 反归一化
-        action = raw_action * self.action_scale + self.action_center
-        action = action.cpu().numpy().flatten()
+        latent_action = raw_action * self.action_scale + self.action_center
 
-        return action
+        # 🔥 使用 ranker 解码 latent action 为 slate
+        if self.ranker is None:
+            raise RuntimeError(
+                "BCAgent.act() requires a ranker for slate decoding. "
+                "Please provide ranker during initialization."
+            )
+
+        # 🔧 确保设备一致性 - 使用 ranker 的设备
+        ranker_device = next(self.ranker.parameters()).device
+        latent_action = latent_action.to(ranker_device)
+
+        # 添加 batch 维度 (ranker 期望 [batch_size, latent_dim])
+        latent_action_batched = latent_action.unsqueeze(0)  # [1, latent_dim]
+
+        # 解码为 slate
+        slate_tensor = self.ranker.rank(latent_action_batched)  # [1, rec_size]
+
+        # 移除 batch 维度并转换为 numpy
+        slate_output = slate_tensor.squeeze(0).cpu().numpy()  # [rec_size]
+
+        return slate_output
 
     def reset_hidden(self):
         """
@@ -325,11 +417,12 @@ def train_bc(config: BCConfig):
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-    # 配置 logging
-    log_filename = f"{config.env_name}_{config.dataset_quality}_seed{config.seed}_{config.run_id}.log"
+    # 配置 logging（包含 ranker 信息）
+    ranker_type = getattr(config, 'ranker_type', 'unknown')
+    log_filename = f"{config.env_name}_{config.dataset_quality}_{ranker_type}_seed{config.seed}_{config.run_id}.log"
     log_filepath = os.path.join(config.log_dir, log_filename)
 
-    # 清除已有的handlers并重新配置
+    # 清除已有的 handlers 并重新配置
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
@@ -361,79 +454,27 @@ def train_bc(config: BCConfig):
     logging.info("=" * 80)
 
     # ========================================================================
-    # 🔥 关键：加载 GeMS 并提取组件（复刻在线逻辑）
+    # 🔥 Load ranker dynamically using RankerFactory
     # ========================================================================
-    from rankers.gems.rankers import GeMS
-
-    # 1. 使用统一配置模块解析 GeMS Checkpoint 路径和参数
-    gems_path, lambda_click = resolve_gems_checkpoint(
-        env_name=config.env_name,
-        dataset_quality=config.dataset_quality
-    )
+    from common.offline.ranker_factory import RankerFactory
 
     logging.info("=" * 80)
-    logging.info("=== Loading Pretrained GeMS (Replicating Online Logic) ===")
+    logging.info("=== Loading Ranker via RankerFactory ===")
+    logging.info(f"Ranker type: {config.ranker_type}")
     logging.info("=" * 80)
-    logging.info(f"Checkpoint: {gems_path}")
-    logging.info(f"Lambda click: {lambda_click}")
 
-    # 2. 加载 GeMS Ranker
-    # 🔥 关键：先创建临时 ItemEmbeddings 用于加载 GeMS
-    temp_embeddings = ItemEmbeddings.from_pretrained(
-        config.item_embedds_path,
-        config.device
+    ranker, action_dim, agent_embeddings = RankerFactory.create(
+        ranker_type=config.ranker_type,
+        config=config,
+        device=config.device
     )
 
-    ranker = GeMS.load_from_checkpoint(
-        gems_path,
-        map_location=config.device,
-        item_embeddings=temp_embeddings,
-        device=config.device,
-        rec_size=config.rec_size,
-        item_embedd_dim=config.item_embedd_dim,
-        num_items=config.num_items,
-        latent_dim=32,  # 从 checkpoint 名称获取
-        lambda_click=lambda_click,  # 动态参数
-        lambda_KL=1.0,  # 从 checkpoint 名称获取
-        lambda_prior=1.0,
-        ranker_lr=3e-3,
-        fixed_embedds="scratch",
-        ranker_sample=False,
-        hidden_layers_infer=[512, 256],
-        hidden_layers_decoder=[256, 512]
-    )
-    ranker.eval()
-    ranker.freeze()
-    logging.info("✅ GeMS loaded and frozen")
+    # Get action dimension from ranker (unified interface)
+    action_dim, _ = ranker.get_action_dim()
 
-    # 显式强制设备同步 (对标 eval_env.py 和 iql.py)
-    ranker = ranker.to(config.device)
-    logging.info(f"✅ GeMS moved to {config.device}")
-
-    # 4. 🔥 关键：提取 GeMS 训练后的 Embeddings
-    gems_embedding_weights = ranker.item_embeddings.weight.data.clone()
-
-    agent_embeddings = ItemEmbeddings(
-        num_items=ranker.item_embeddings.num_embeddings,
-        item_embedd_dim=ranker.item_embeddings.embedding_dim,
-        device=config.device,
-        weights=gems_embedding_weights
-    )
-
-    # 5. 🔥 关键：提前冻结（在传入 GRUBelief 前）
-    for param in agent_embeddings.parameters():
-        param.requires_grad = False
-    logging.info("✅ Agent embeddings created and frozen")
-
-    # 6. 准备 Ranker 参数包
-    ranker_params = {
-        'item_embeddings': agent_embeddings,
-        'action_center': ranker.action_center,
-        'action_scale': ranker.action_scale,
-        'num_items': ranker.num_items,
-        'item_embedd_dim': ranker.item_embedd_dim
-    }
-    logging.info("=" * 80)
+    logging.info(f"✅ Ranker loaded: {config.ranker_type}")
+    logging.info(f"  Action dim: {action_dim}")
+    logging.info("")
 
     # ========================================================================
     # 加载数据集
@@ -460,8 +501,8 @@ def train_bc(config: BCConfig):
     logging.info("=" * 80)
     logging.info("")
 
-    # Get action dimension from ranker
-    action_dim = ranker.latent_dim
+    # Action dim already obtained from RankerFactory.create()
+    # No need to get it again
 
     logging.info(f"\nEnvironment info:")
     logging.info(f"  Action dim: {action_dim}")
@@ -508,15 +549,23 @@ def train_bc(config: BCConfig):
     action_scale = (action_max - action_min) / 2 + 1e-6
 
     logging.info(f"✅ Action normalization computed from {sample_size} samples")
-    logging.info(f"  center shape: {action_center.shape}")
     logging.info(f"  center mean: {action_center.mean().item():.6f}")
-    logging.info(f"  scale shape: {action_scale.shape}")
     logging.info(f"  scale mean: {action_scale.mean().item():.6f}")
     logging.info("")
 
-    # Update ranker_params with computed action bounds
-    ranker_params['action_center'] = action_center
-    ranker_params['action_scale'] = action_scale
+    # 🔥 Freeze embeddings
+    for param in agent_embeddings.parameters():
+        param.requires_grad = False
+    logging.info("✅ Agent embeddings frozen")
+
+    # Construct ranker_params
+    ranker_params = {
+        'item_embeddings': agent_embeddings,
+        'action_center': action_center,
+        'action_scale': action_scale,
+        'num_items': agent_embeddings.num_items,
+        'item_embedd_dim': config.item_embedd_dim
+    }
 
     # Initialize BC agent (with GeMS-aligned architecture)
     agent = BCAgent(
@@ -579,46 +628,90 @@ def train_bc(config: BCConfig):
 
         # Logging
         if (t + 1) % 1000 == 0:
-            # 构建统一的 SwanLab 指标字典（带命名空间前缀）
+            # 🔥 构建分组的 SwanLab 指标字典（6 个类别）
             swanlab_metrics = {
-                # BC 的 bc_loss 映射到统一的 actor_loss
-                "train/actor_loss": metrics['bc_loss'],
-                "train/actor_grad_norm": metrics['actor_grad_norm'],
-                "train/action_mean": metrics['action_mean'],
-                "train/action_std": metrics['action_std'],
-                "train/action_min": metrics['action_min'],
-                "train/action_max": metrics['action_max'],
-                # BC 特有指标
-                "train/target_action_mean": metrics['target_action_mean'],
-                "train/target_action_std": metrics['target_action_std'],
-                "train/gru_grad_norm": metrics['gru_grad_norm'],
+                # 1️⃣ Loss 指标（1 个）
+                "1_Loss/bc_loss": metrics['bc_loss'],
+
+                # 2️⃣ Action 统计（6 个）
+                "2_Action/mean": metrics['action_mean'],
+                "2_Action/std": metrics['action_std'],
+                "2_Action/min": metrics['action_min'],
+                "2_Action/max": metrics['action_max'],
+                "2_Action/target_mean": metrics['target_action_mean'],
+                "2_Action/target_std": metrics['target_action_std'],
+
+                # 3️⃣ 梯度范数（2 个）
+                "3_Gradient/actor_norm": metrics['actor_grad_norm'],
+                "3_Gradient/gru_norm": metrics['gru_grad_norm'],
+
+                # 4️⃣ "死亡探头"：Log Std 统计（7 个）- 🔥 核心监控
+                "4_LogStd/raw_min": metrics['actor_log_std_raw_min'],
+                "4_LogStd/raw_mean": metrics['actor_log_std_raw_mean'],
+                "4_LogStd/raw_max": metrics['actor_log_std_raw_max'],
+                "4_LogStd/min": metrics['actor_log_std_min'],
+                "4_LogStd/mean": metrics['actor_log_std_mean'],  # 🔥 关键：方差是否坍缩
+                "4_LogStd/max": metrics['actor_log_std_max'],
+                "4_LogStd/floor_hit_rate": metrics['actor_log_std_floor_hit_rate'],  # 🔥 关键：是否撞底
+
+                # 5️⃣ 策略健康（3 个）
+                "5_Policy/tanh_saturation_ratio": metrics['tanh_saturation_ratio'],
+                "5_Policy/distance_to_origin": metrics['policy_distance_to_origin'],
+                "5_Policy/entropy": metrics['policy_entropy'],
+                "5_Policy/ood_distance_mean_det": metrics['ood_distance_mean_det'],
+                "5_Policy/ood_distance_max_det": metrics['ood_distance_max_det'],
+                "5_Policy/ood_distance_mean_samp": metrics['ood_distance_mean_samp'],
+                "5_Policy/ood_distance_max_samp": metrics['ood_distance_max_samp'],
+
+                # 6️⃣ 采样时序监控（1 个）- 🔥 数据顺序效应探针
+                "Batch_Data/reward_mean": metrics['batch_reward_mean'],
             }
 
-            # 全量本地日志记录（与 SwanLab 完全一致）
-            log_parts = [f"Step {t+1}/{config.max_timesteps}:"]
-            for key, value in swanlab_metrics.items():
-                short_key = key.replace("train/", "")
-                log_parts.append(f"{short_key}={value:.6f}")
-            logging.info(", ".join(log_parts))
+            # 完整分类日志记录
+            progress_pct = (t + 1) / config.max_timesteps * 100
+            logging.info(f"[Training] Step {t+1}/{config.max_timesteps} ({progress_pct:.1f}%)")
+
+            # 1. Loss 指标
+            logging.info(f"  [1] Loss: bc_loss={metrics['bc_loss']:.6f}")
+
+            # 2. Action 统计
+            logging.info(f"  [2] Action: mean={metrics['action_mean']:.6f}, std={metrics['action_std']:.6f}, min={metrics['action_min']:.6f}, max={metrics['action_max']:.6f}, target_mean={metrics['target_action_mean']:.6f}, target_std={metrics['target_action_std']:.6f}")
+
+            # 3. 梯度范数
+            logging.info(f"  [3] Gradient: actor_norm={metrics['actor_grad_norm']:.6f}, gru_norm={metrics['gru_grad_norm']:.6f}")
+
+            # 4. Log Std 统计（"死亡探头"）
+            logging.info(
+                f"  [4] LogStd: raw(mean={metrics['actor_log_std_raw_mean']:.6f}, floor_hit={metrics['actor_log_std_floor_hit_rate']:.4f}), "
+                f"clamped(mean={metrics['actor_log_std_mean']:.6f})"
+            )
+
+            # 5. 策略健康
+            logging.info(
+                f"  [5] Policy: tanh_saturation={metrics['tanh_saturation_ratio']:.4f}, "
+                f"distance_to_origin={metrics['policy_distance_to_origin']:.6f}, "
+                f"entropy={metrics['policy_entropy']:.6f}, "
+                f"ood_det(mean={metrics['ood_distance_mean_det']:.4f}, max={metrics['ood_distance_max_det']:.4f}), "
+                f"ood_samp(mean={metrics['ood_distance_mean_samp']:.4f}, max={metrics['ood_distance_max_samp']:.4f})"
+            )
+            logging.info("")  # 空行分隔
 
             if swan_logger:
                 swan_logger.log_metrics(swanlab_metrics, step=t+1)
 
         # Evaluation
         if eval_env is not None and (t + 1) % config.eval_freq == 0:
-            logging.info(f"\n{'='*80}")
-            logging.info(f"Evaluating at step {t+1}")
-            logging.info(f"{'='*80}")
-
             eval_metrics = eval_env.evaluate_policy(
                 agent=agent,
                 num_episodes=10,
                 deterministic=True
             )
 
-            log_msg = (f"Evaluation: mean_reward={eval_metrics['mean_reward']:.2f} ± "
-                      f"{eval_metrics['std_reward']:.2f}")
-            logging.info(log_msg)
+            # 简洁的 Evaluation 日志
+            logging.info(f"[Evaluation] Step {t+1}/{config.max_timesteps}")
+            logging.info(f"  Reward: {eval_metrics['mean_reward']:.2f} ± {eval_metrics['std_reward']:.2f} (min={eval_metrics.get('min_reward', 0):.2f}, max={eval_metrics.get('max_reward', 0):.2f})")
+            logging.info(f"  Episode Length: {eval_metrics['mean_episode_length']:.1f}")
+            logging.info("")  # 空行分隔
 
             if swan_logger:
                 swan_logger.log_metrics({
@@ -666,7 +759,7 @@ def train_bc(config: BCConfig):
             }, step=config.max_timesteps)
 
     logging.info(f"\n{'='*80}")
-    logging.info(f"BC training completed!")
+    logging.info(f"BC 训练完成！")
     logging.info(f"{'='*80}")
 
     if swan_logger:
@@ -684,11 +777,11 @@ if __name__ == "__main__":
     parser.add_argument("--env_name", type=str, default="diffuse_mix",
                         help="环境名称")
     parser.add_argument("--dataset_quality", type=str, default="expert",
-                        help="数据集质量 (旧benchmark: random/medium/expert, 新benchmark: v2_b3/v2_b5)")
+                        help="数据集质量 (旧 benchmark: random/medium/expert, 新 benchmark: v2_b3/v2_b5)")
     parser.add_argument("--seed", type=int, default=58407201,
                         help="随机种子")
     parser.add_argument("--run_id", type=str, default="",
-                        help="唯一运行标识符 (格式: MMDD_HHMM, 如果为空则自动生成)")
+                        help="唯一运行标识符 (格式：MMDD_HHMM, 如果为空则自动生成)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="设备")
 
@@ -712,11 +805,33 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", type=int, default=256,
                         help="隐藏层维度")
 
-    # SwanLab配置
+    # 🔥 Ranker configuration (解耦架构)
+    parser.add_argument("--ranker", type=str, default="gems",
+                        choices=["gems", "topk", "kheadargmax", "wolpertinger", "wolpertinger_slate"],
+                        help="Ranker 类型：gems, topk, kheadargmax, wolpertinger, wolpertinger_slate")
+
+    # 🔥 Wolpertinger Ranker 参数
+    parser.add_argument("--wolpertinger_k", type=int, default=50,
+                        help="Wolpertinger kNN 候选数量")
+    parser.add_argument("--wolpertinger_hidden_dims", type=int, nargs='+', default=[256, 128],
+                        help="Wolpertinger Actor 隐层维度")
+
+    # SwanLab 配置
     parser.add_argument("--use_swanlab", action="store_true", default=True,
-                        help="是否使用SwanLab")
+                        help="是否使用 SwanLab")
     parser.add_argument("--no_swanlab", action="store_false", dest="use_swanlab",
-                        help="禁用SwanLab")
+                        help="禁用 SwanLab")
+
+    # 🔥 SwanLab 配置
+    parser.add_argument("--swan_project", type=str, default="Offline_Slate_RL_202603",
+                        help="SwanLab 项目名称")
+    parser.add_argument("--swan_workspace", type=str, default="Cliff",
+                        help="SwanLab 工作空间")
+    parser.add_argument("--swan_mode", type=str, default="cloud",
+                        choices=["cloud", "local", "offline"],
+                        help="SwanLab 运行模式")
+    parser.add_argument("--swan_logdir", type=str, default="experiments/swanlog",
+                        help="SwanLab 本地日志目录")
 
     args = parser.parse_args()
 
@@ -736,6 +851,15 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         hidden_dim=args.hidden_dim,
         use_swanlab=args.use_swanlab,
+        # 🔥 SwanLab 配置
+        swan_project=args.swan_project,
+        swan_workspace=args.swan_workspace,
+        swan_mode=args.swan_mode,
+        swan_logdir=args.swan_logdir,
+        # 🔥 Ranker configuration
+        ranker_type=args.ranker,
+        wolpertinger_k=args.wolpertinger_k,
+        wolpertinger_hidden_dims=args.wolpertinger_hidden_dims,
     )
 
     train_bc(config)

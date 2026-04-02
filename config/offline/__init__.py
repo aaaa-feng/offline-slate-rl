@@ -13,7 +13,7 @@
 """
 
 # 从子模块导出
-from .algorithms import (
+from .config import (
     BaseOfflineConfig,
     BCConfig,
     TD3BCConfig,

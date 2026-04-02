@@ -82,3 +82,10 @@ data/test_data/
 test/datacollecttest/
 *.pkl
 *.npz
+
+# Local experiment artifacts (keep code, ignore outputs)
+motivation_test/
+analysis/*.json
+test/offlinetest/**/*.json
+test/offlinetest/**/*_ANALYSIS_REPORT.md
+Cross-Pollination_SUMO_IQL_Analysis.md

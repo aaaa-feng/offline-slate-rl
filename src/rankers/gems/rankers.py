@@ -72,13 +72,53 @@ class TopKRanker(Ranker):
             Here the action is expected to be in the space of item embeddings.
         '''
         with torch.inference_mode():
-            similarity = torch.matmul(self.item_embeddings.get_weights(), action)
+            # Handle batch dimension: action shape [batch_size, item_embedd_dim] or [item_embedd_dim]
+            if action.dim() == 1:
+                action_vec = action.unsqueeze(1)  # [item_embedd_dim, 1]
+            else:
+                action_vec = action.squeeze(0).unsqueeze(1)  # [batch_size, item_embedd_dim] -> [item_embedd_dim, 1]
+
+            similarity = torch.matmul(self.item_embeddings.get_weights(), action_vec).squeeze(1)  # [num_items]
             #similarity /= torch.linalg.vector_norm(similarity, dim = 1)
         if clicked is None:
             return torch.topk(similarity, k = self.rec_size, sorted = True)[1]
         else:
             unique, counts = torch.cat([torch.arange(self.num_items, device = self.device), clicked]).unique(return_counts = True)
             return unique[counts == 1][torch.topk(similarity[unique[counts == 1]], k = self.rec_size, sorted = True)[1]]
+
+    def run_inference(self, slates, clicks=None) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        '''
+            Inverse mapping: slate → action (approximate for TopKRanker).
+
+            For TopKRanker, the inverse mapping is not unique (many actions can produce
+            the same Top-K slate). We use simple average of item embeddings as a
+            representative action, avoiding position weighting to prevent training
+            target drift.
+
+            Args:
+                slates: [batch_size, rec_size] or [batch_size, traj_len, rec_size]
+                clicks: Not used, kept for interface compatibility
+
+            Returns:
+                actions: [batch_size, item_embedd_dim]
+                log_var: [batch_size, item_embedd_dim] (set to -10.0 for deterministic)
+        '''
+        # Handle batch of trajectories
+        if len(slates.shape) == 3:
+            slates = slates.flatten(end_dim=1)
+
+        batch_size = slates.shape[0]
+
+        # Get embeddings for all items in slates: [batch_size, rec_size, item_embedd_dim]
+        slate_embeddings = self.item_embeddings.embedd(slates)
+
+        # Simple average (no position weighting to avoid training target drift)
+        actions = slate_embeddings.mean(dim=1)  # [batch_size, item_embedd_dim]
+
+        # Log variance set to -10.0 (deterministic, exp(-10) ≈ 0)
+        log_var = torch.full_like(actions, -10.0)
+
+        return actions, log_var
 
 class kHeadArgmaxRanker(TopKRanker):
     '''
@@ -114,6 +154,40 @@ class kHeadArgmaxRanker(TopKRanker):
         else:
             unique, counts = torch.cat([torch.arange(self.num_items, device = self.device), clicked]).unique(return_counts = True)
             return unique[counts == 1][torch.argmax(similarity[unique[counts == 1], :], dim = 0)]
+
+    def run_inference(self, slates, clicks=None) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        '''
+            Inverse mapping: slate → action (exact reconstruction for kHeadArgmaxRanker).
+
+            For kHeadArgmaxRanker, the inverse mapping is exact because each position
+            independently selects an item. The action format must match rank()'s expectation:
+            action.reshape(item_embedd_dim, rec_size) where each column is a position's embedding.
+
+            Args:
+                slates: [batch_size, rec_size] or [batch_size, traj_len, rec_size]
+                clicks: Not used, kept for interface compatibility
+
+            Returns:
+                actions: [batch_size, item_embedd_dim * rec_size]
+                log_var: [batch_size, item_embedd_dim * rec_size] (set to -10.0 for deterministic)
+        '''
+        # Handle batch of trajectories
+        if len(slates.shape) == 3:
+            slates = slates.flatten(end_dim=1)
+
+        batch_size = slates.shape[0]
+
+        # Get embeddings for all items: [batch_size, rec_size, item_embedd_dim]
+        slate_embeddings = self.item_embeddings.embedd(slates)
+
+        # Transpose to [batch_size, item_embedd_dim, rec_size] then flatten
+        # This ensures that after reshape(item_embedd_dim, rec_size), each column is a position's embedding
+        actions = slate_embeddings.transpose(1, 2).flatten(start_dim=1)  # [batch_size, item_embedd_dim * rec_size]
+
+        # Log variance set to -10.0 (deterministic, exp(-10) ≈ 0)
+        log_var = torch.full_like(actions, -10.0)
+
+        return actions, log_var
 
 class AbstractGeMS(Ranker):
     '''
@@ -450,3 +524,354 @@ class GeMS(AbstractGeMS):
 
     def run_prior(self) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         return torch.zeros(self.latent_dim, device = self.device), torch.zeros(self.latent_dim, device = self.device)
+
+
+# ============================================================================
+# Wolpertinger-style Rankers (借鉴自 rl_wolpertinger 项目)
+# ============================================================================
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class WolpertingerActor(nn.Module):
+    """
+    Wolpertinger Actor 网络：生成 proto-action
+    
+    输入：state (GRU belief state)
+    输出：proto-action (item embedding 空间中的连续向量)
+    """
+    def __init__(self, state_dim: int, action_dim: int, hidden_dims: List[int]):
+        super(WolpertingerActor, self).__init__()
+        
+        layers = []
+        prev_dim = state_dim
+        for dim in hidden_dims:
+            layers.append(Linear(prev_dim, dim))
+            layers.append(ReLU())
+            prev_dim = dim
+        layers.append(Linear(prev_dim, action_dim))
+        
+        self.network = Sequential(*layers)
+    
+    def forward(self, state):
+        """输出 proto-action"""
+        return self.network(state)
+
+
+class WolpertingerRanker(Ranker):
+    """
+    Wolpertinger-style ranker: Actor → proto-action → kNN → Top-K
+    
+    核心思想：
+    1. Actor 网络生成 proto-action（原型动作）
+    2. 在 item embeddings 中进行 kNN 搜索
+    3. 从 k 个候选中选择 Top-rec_size
+    
+    与 TopKRanker 的区别：
+    - TopKRanker: 直接相似度排序
+    - WolpertingerRanker: 先 kNN 筛选，再选择
+    
+    Action space: [item_embedd_dim] (20-dim)
+    """
+    def __init__(
+        self,
+        item_embeddings: ItemEmbeddings,
+        item_embedd_dim: int,
+        rec_size: int,
+        device: torch.device,
+        k: int = 50,  # kNN 候选数量
+        actor_hidden_dims: List[int] = None,
+        state_dim: int = 20,  # GRU belief state 维度
+        **kwargs
+    ):
+        super().__init__(item_embeddings, item_embedd_dim, device, rec_size, **kwargs)
+        self.k = min(k, self.num_items)  # 确保 k 不超过 item 总数
+        
+        # 创建 Actor 网络（注意：在联合训练中，这个 Actor 不会被使用）
+        if actor_hidden_dims is None:
+            actor_hidden_dims = [256, 128]
+        
+        self.actor = WolpertingerActor(
+            state_dim=state_dim,
+            action_dim=item_embedd_dim,
+            hidden_dims=actor_hidden_dims
+        )
+    
+    def get_action_dim(self) -> Tuple[int, int]:
+        return self.item_embedd_dim, 1  # 20
+    
+    def rank(self, action, clicked=None) -> torch.LongTensor:
+        """
+        将 proto-action 解码为 slate
+        
+        Args:
+            action: [batch_size, item_embedd_dim] - proto-action
+            clicked: 可选，已点击的 items
+        
+        Returns:
+            [batch_size, rec_size] - slate of item IDs
+        """
+        # 处理批次维度
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        
+        batch_size = action.shape[0]
+        slates = []
+        
+        for i in range(batch_size):
+            proto_action = action[i]  # [item_embedd_dim]
+            
+            # kNN 搜索：计算与所有 items 的欧氏距离
+            distances = torch.linalg.norm(
+                self.item_embeddings.get_weights() - proto_action.unsqueeze(0),
+                dim=1
+            )
+            
+            # 选择距离最小的 k 个 items
+            topk_indices = torch.argsort(distances)[:self.k]
+            
+            # 从 k 个候选中选择 Top-rec_size
+            # 简化版：直接选择最近的 rec_size 个
+            slate = topk_indices[:self.rec_size]
+            slates.append(slate)
+        
+        return torch.stack(slates)
+    
+    def run_inference(self, slates, clicks=None) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        """
+        Inverse mapping: slate → proto-action
+        
+        使用 slate 中 items 的平均 embedding 作为 proto-action
+        （与 TopKRanker 相同的策略）
+        """
+        slate_embeddings = self.item_embeddings(slates)  # [batch, rec_size, embedd_dim]
+        proto_action = slate_embeddings.mean(dim=1)  # [batch, embedd_dim]
+        log_var = torch.full_like(proto_action, -10.0)  # 确定性（低方差）
+        return proto_action, log_var
+
+
+class WolpertingerActorSlate(nn.Module):
+    """
+    Wolpertinger Slate Actor 网络：生成 proto-slate
+    
+    输入：state (GRU belief state)
+    输出：proto-slate (rec_size 个 item embeddings)
+    """
+    def __init__(self, state_dim: int, action_dim: int, rec_size: int, hidden_dims: List[int]):
+        super(WolpertingerActorSlate, self).__init__()
+        
+        layers = []
+        prev_dim = state_dim
+        for dim in hidden_dims:
+            layers.append(Linear(prev_dim, dim))
+            layers.append(ReLU())
+            prev_dim = dim
+        layers.append(Linear(prev_dim, action_dim * rec_size))
+        
+        self.network = Sequential(*layers)
+    
+    def forward(self, state):
+        """输出 proto-slate"""
+        return self.network(state)
+
+
+class WolpertingerSlateRanker(Ranker):
+    """
+    Wolpertinger Slate ranker: Actor → proto-slate → 多位置 kNN → slate
+    
+    核心思想：
+    1. Actor 网络生成 proto-slate（每个位置一个 proto-item）
+    2. 对每个位置独立进行 kNN 搜索
+    3. 选择每个位置最近的 item
+    
+    与 kHeadArgmaxRanker 的区别：
+    - kHeadArgmaxRanker: 每个位置独立 argmax
+    - WolpertingerSlateRanker: 每个位置独立 kNN
+    
+    Action space: [rec_size * item_embedd_dim] (200-dim)
+    """
+    def __init__(
+        self,
+        item_embeddings: ItemEmbeddings,
+        item_embedd_dim: int,
+        rec_size: int,
+        device: torch.device,
+        k: int = 50,
+        actor_hidden_dims: List[int] = None,
+        state_dim: int = 20,
+        **kwargs
+    ):
+        super().__init__(item_embeddings, item_embedd_dim, device, rec_size, **kwargs)
+        self.k = min(k, self.num_items)
+        
+        # 扩展 action_center/scale 以支持每个位置
+        self.action_center = self.action_center.repeat(rec_size)
+        self.action_scale = self.action_scale.repeat(rec_size)
+        
+        # 创建 Actor 网络
+        if actor_hidden_dims is None:
+            actor_hidden_dims = [256, 128]
+        
+        self.actor = WolpertingerActorSlate(
+            state_dim=state_dim,
+            action_dim=item_embedd_dim,
+            rec_size=rec_size,
+            hidden_dims=actor_hidden_dims
+        )
+    
+    def get_action_dim(self) -> Tuple[int, int]:
+        return self.item_embedd_dim * self.rec_size, 1  # 200
+    
+    def rank(self, action, clicked=None) -> torch.LongTensor:
+        """
+        将 proto-slate 解码为 slate
+        
+        Args:
+            action: [batch_size, rec_size * item_embedd_dim] - proto-slate
+            clicked: 可选，已点击的 items
+        
+        Returns:
+            [batch_size, rec_size] - slate of item IDs
+        """
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        
+        batch_size = action.shape[0]
+        slates = []
+        
+        for i in range(batch_size):
+            # Reshape 为 [rec_size, item_embedd_dim]
+            proto_slate = action[i].reshape(self.rec_size, self.item_embedd_dim)
+            
+            slate = []
+            for pos in range(self.rec_size):
+                proto_item = proto_slate[pos]
+                
+                # 对每个位置做 kNN
+                distances = torch.linalg.norm(
+                    self.item_embeddings.get_weights() - proto_item.unsqueeze(0),
+                    dim=1
+                )
+                topk_indices = torch.argsort(distances)[:self.k]
+                
+                # 选择最近的 item
+                slate.append(topk_indices[0])
+            
+            slates.append(torch.tensor(slate, device=self.device))
+        
+        return torch.stack(slates)
+    
+    def run_inference(self, slates, clicks=None) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        """
+        Inverse mapping: slate → proto-slate
+        
+        精确重构：每个位置的 embedding 按顺序排列
+        （与 kHeadArgmaxRanker 相同的策略）
+        """
+        slate_embeddings = self.item_embeddings(slates)  # [batch, rec_size, embedd_dim]
+        # Transpose 后 flatten: [batch, embedd_dim, rec_size] → [batch, embedd_dim * rec_size]
+        proto_slate = slate_embeddings.transpose(1, 2).flatten(start_dim=1)
+        log_var = torch.full_like(proto_slate, -10.0)
+        return proto_slate, log_var
+
+
+class GreedySlateRanker(Ranker):
+    """
+    Greedy slate generator: 迭代贪心选择，考虑累积效应
+    
+    核心思想：
+    1. 迭代选择 items，每次选择使边际收益最大的 item
+    2. 考虑已选 items 对后续选择的影响（累积分子/分母）
+    3. 使用 mask 机制防止重复选择
+    
+    与 TopKRanker 的区别：
+    - TopKRanker: 一次性选择 Top-K
+    - GreedySlateRanker: 迭代选择，考虑累积效应
+    
+    Action space: [item_embedd_dim] (20-dim)
+    
+    参考：rl_slate_wolpertinger 项目的 GreedySlateGenerator
+    """
+    def __init__(
+        self,
+        item_embeddings: ItemEmbeddings,
+        item_embedd_dim: int,
+        rec_size: int,
+        device: torch.device,
+        s_no_click: float = -1.0,  # 无点击的基准分数
+        **kwargs
+    ):
+        super().__init__(item_embeddings, item_embedd_dim, device, rec_size, **kwargs)
+        self.s_no_click = s_no_click
+    
+    def get_action_dim(self) -> Tuple[int, int]:
+        return self.item_embedd_dim, 1  # 20
+    
+    def rank(self, action, clicked=None) -> torch.LongTensor:
+        """
+        使用贪心算法生成 slate
+        
+        Args:
+            action: [batch_size, item_embedd_dim] - 用于计算 item scores
+            clicked: 可选，已点击的 items
+        
+        Returns:
+            [batch_size, rec_size] - slate of item IDs
+        """
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        
+        batch_size = action.shape[0]
+        slates = []
+        
+        for i in range(batch_size):
+            # 计算所有 items 的评分（相似度）
+            action_vec = action[i].unsqueeze(1)  # [item_embedd_dim, 1]
+            scores = torch.matmul(
+                self.item_embeddings.get_weights(),
+                action_vec
+            ).squeeze(1)  # [num_items]
+            
+            # 假设 Q-values 为 1（简化版）
+            # 在实际应用中，可以从 Critic 网络获取 Q-values
+            qvals = torch.ones_like(scores)
+            
+            # 贪心选择
+            numerator = torch.tensor(0.0, device=self.device)
+            denominator = torch.tensor(self.s_no_click, device=self.device)
+            mask = torch.ones_like(qvals, dtype=torch.bool)
+            
+            slate = []
+            for _ in range(self.rec_size):
+                # 计算每个候选的边际收益
+                # marginal_value = (累积奖励 + 新item奖励) / (累积评分 + 新item评分)
+                marginal_value = (numerator + scores * qvals) / (denominator + scores)
+                
+                # 排除已选的 items
+                marginal_value[~mask] = float('-inf')
+                
+                # 选择最大边际收益的 item
+                k = torch.argmax(marginal_value)
+                
+                slate.append(k.item())
+                mask[k] = False
+                
+                # 更新累积值
+                numerator = numerator + scores[k] * qvals[k]
+                denominator = denominator + scores[k]
+            
+            slates.append(torch.tensor(slate, device=self.device))
+        
+        return torch.stack(slates)
+    
+    def run_inference(self, slates, clicks=None) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        """
+        Inverse mapping: slate → action
+        
+        使用 slate 中 items 的平均 embedding
+        """
+        slate_embeddings = self.item_embeddings(slates)
+        action = slate_embeddings.mean(dim=1)
+        log_var = torch.full_like(action, -10.0)
+        return action, log_var
